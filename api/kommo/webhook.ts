@@ -22,33 +22,62 @@ function firstNum(...vals: any[]): number {
   return 0;
 }
 
+function maskSecret(s: string | undefined) {
+  if (!s) return "";
+  const str = String(s);
+  if (str.length <= 8) return "***";
+  return `${str.slice(0, 2)}***${str.slice(-4)}`;
+}
+
 export const config = { runtime: "nodejs" };
 
 export default async function handler(req: any, res: any) {
+  const started = Date.now();
   try {
     const method = (req.method || "GET").toUpperCase();
+    const urlPath: string = req.url || "";
+    const ua = String(req.headers["user-agent"] || "");
+    const ip =
+      (req.headers["x-real-ip"] as string) ||
+      (Array.isArray(req.headers["x-forwarded-for"])
+        ? req.headers["x-forwarded-for"][0]
+        : (req.headers["x-forwarded-for"] as string) || "");
+
+    // Logs básicos (no PII sensible)
+    console.log("📩 KOMMO WEBHOOK HIT", {
+      method,
+      urlPath,
+      ua,
+      ip,
+      ct: req.headers["content-type"],
+      cl: req.headers["content-length"],
+    });
+
     if (method !== "GET" && method !== "POST") {
+      console.warn("⚠️ Método no permitido:", method);
       return res.status(405).json({ error: "Method not allowed" });
     }
 
     // 1) Seguridad mínima (plan básico): secret por query o en el path
-    //    Permite dos estilos:
+    //    Estilos soportados:
     //    - /api/kommo/webhook?secret=XXXX
     //    - /api/kommo/webhook/XXXX
-    const ua = String(req.headers["user-agent"] || "");
-    if (!ua.toLowerCase().includes("amocrm-webhooks")) {
-      // No es bala de plata, pero filtra bots accidentales
-      // Si quieres quitar esto para pruebas locales, comenta la línea siguiente.
-      // return res.status(403).json({ error: "Forbidden UA" });
-    }
-
-    const urlPath: string = req.url || ""; // e.g. "/api/kommo/webhook/SECRET?lead_id=1"
     const pathSecret = (() => {
       const m = urlPath.match(/\/api\/kommo\/webhook\/([^/?#]+)/);
       return m?.[1] || "";
     })();
     const qsSecret = (req.query?.secret as string) || "";
+
+    console.log("🔑 Secrets (masked)", {
+      expected: maskSecret(WEBHOOK_SECRET),
+      fromPath: maskSecret(pathSecret),
+      fromQuery: maskSecret(qsSecret),
+      usePathMatch: Boolean(pathSecret),
+      useQueryMatch: Boolean(qsSecret),
+    });
+
     if (WEBHOOK_SECRET && pathSecret !== WEBHOOK_SECRET && qsSecret !== WEBHOOK_SECRET) {
+      console.warn("🚫 Secret inválido. Rechazando petición.");
       return res.status(401).json({ error: "Unauthorized" });
     }
 
@@ -59,14 +88,7 @@ export default async function handler(req: any, res: any) {
     let text = firstStr(body.text, req.query?.text);
     let leadId = firstNum(body.lead_id, req.query?.lead_id);
 
-    // b) Formato "Chats Webhooks" de Kommo (según docs):
-    //    Suele traer algo como:
-    //    {
-    //      "event": "...",
-    //      "message": { "text": "...", "type": "...", ... },
-    //      "conversation": { "id":..., "lead_id":..., ... },
-    //      "contact": { "id":..., "name":... }, ...
-    //    }
+    // b) Formato "Chats Webhooks" de Kommo
     if (!text) {
       text = firstStr(
         body?.message?.text,                 // texto del mensaje
@@ -82,7 +104,7 @@ export default async function handler(req: any, res: any) {
       );
     }
 
-    // c) Otros lugares “típicos” en webhooks de Kommo
+    // c) Otros lugares típicos
     if (!text) {
       text = firstStr(
         body?.note?.text,
@@ -91,20 +113,37 @@ export default async function handler(req: any, res: any) {
       );
     }
 
-    if (!text) return res.status(400).json({ error: "Missing text" });
-    if (!leadId) return res.status(400).json({ error: "Missing lead_id" });
+    // Loggear lo que detectamos (sin volarnos)
+    console.log("🧩 Parsed payload snapshot", {
+      hasBody: Object.keys(body).length > 0,
+      query: req.query,
+      derived: { text, leadId },
+    });
+
+    if (!text) {
+      console.warn("❗ Missing text");
+      return res.status(400).json({ error: "Missing text" });
+    }
+    if (!leadId) {
+      console.warn("❗ Missing lead_id");
+      return res.status(400).json({ error: "Missing lead_id" });
+    }
 
     // 3) Llamar al Assistant con sesión por lead
     const result = await processWithAssistant({ text, leadId });
 
-    // 4) Responder en Kommo con Nota (y/o luego cambiamos a mensaje de salida del canal)
+    // 4) Responder en Kommo con Nota
     if (result.text) {
       try {
         await postNoteToLead(leadId, result.text);
+        console.log("📝 Nota creada en Kommo", { leadId, len: result.text.length });
       } catch (e) {
-        console.error("postNoteToLead error:", (e as any)?.response?.data || e);
+        console.error("💥 postNoteToLead error:", (e as any)?.response?.data || e);
       }
     }
+
+    const duration = Date.now() - started;
+    console.log("✅ Webhook OK", { leadId, thread_id: result.threadId, run_status: result.runStatus, ms: duration });
 
     return res.status(200).json({
       ok: true,
@@ -115,7 +154,8 @@ export default async function handler(req: any, res: any) {
       run_status: result.runStatus
     });
   } catch (err: any) {
-    console.error("kommo/webhook error:", err?.response?.data || err);
+    const duration = Date.now() - started;
+    console.error("💥 kommo/webhook error:", err?.response?.data || err, { ms: duration });
     return res.status(500).json({ error: err?.message || "Server error" });
   }
 }
