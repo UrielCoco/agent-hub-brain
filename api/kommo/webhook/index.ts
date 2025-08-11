@@ -1,6 +1,6 @@
 // agent-hub-brain/api/kommo/webhook/index.ts
 import { processWithAssistant } from "../../../src/services/openai.js";
-import { postNoteToLead } from "../../../src/services/kommo.js";
+import { postNoteToLead, getLatestMessageForLead } from "../../../src/services/kommo.js";
 import { WEBHOOK_SECRET } from "../../../src/config.js";
 
 type AnyDict = Record<string, any>;
@@ -36,16 +36,18 @@ function findTextLoose(obj: AnyDict): string {
   const candidates: string[] = [];
   const push = (v: any) => { if (v) candidates.push(String(v)); };
   try {
+    // Chats webhooks típicos
     push(obj?.message?.text);
     push(obj?.message?.payload?.text);
     push(obj?.data?.message?.text);
+    // Notas / comentarios
     push(obj?.note?.text);
     push(obj?.comment?.text);
     push(obj?.last_message?.text);
-    // claves planas típicas cuando viene como form-urlencoded
+    // Cuando llega como form-urlencoded "aplanado"
     for (const k of Object.keys(obj)) {
       const lk = k.toLowerCase();
-      if (lk.includes("text") || lk.includes("message")) push(obj[k]);
+      if (lk.includes("message") || lk.includes("text")) push(obj[k]);
       if (lk.endsWith("[text]")) push(obj[k]);
     }
   } catch {}
@@ -57,7 +59,7 @@ function findLeadIdLoose(obj: AnyDict): number {
     cands.push(obj?.conversation?.lead_id);
     cands.push(obj?.lead?.id);
     cands.push(obj?.data?.lead_id);
-    // claves planas típicas
+    // Cuando llega como form-urlencoded "aplanado"
     for (const k of Object.keys(obj)) {
       const lk = k.toLowerCase();
       if (lk.endsWith("lead_id") || lk.endsWith("[lead_id]") || lk.endsWith("[id]")) {
@@ -67,6 +69,8 @@ function findLeadIdLoose(obj: AnyDict): number {
         cands.push(obj[k]);
       }
     }
+    // Formato CRM "lead creado": leads[add][0][id]
+    if (obj["leads[add][0][id]"]) cands.push(obj["leads[add][0][id]"]);
   } catch {}
   return firstNum(...cands);
 }
@@ -127,17 +131,34 @@ export default async function handler(req: any, res: any) {
       derived: { text, leadId }
     });
 
+    // 👉 Fallback: si no hay texto (p.ej. webhook "lead creado"),
+    // consulta el último mensaje del lead vía API de Kommo.
+    if (!text && leadId) {
+      try {
+        const last = await getLatestMessageForLead(leadId);
+        if (last && typeof last === "string" && last.trim()) {
+          text = last.trim();
+          console.log("🔎 Fallback text from Kommo:", text.slice(0, 160));
+        }
+      } catch (e) {
+        console.warn("⚠️ No pude obtener último mensaje del lead:", (e as any)?.response?.data || e);
+      }
+    }
+
+    // Si aún no hay texto, acuse sin error para que Kommo no reintente.
     if (!text) {
-      console.warn("❗ Missing text");
-      return res.status(400).json({ error: "Missing text" });
+      console.warn("ℹ️ No text in payload; acking event.");
+      return res.status(204).end();
     }
     if (!leadId) {
       console.warn("❗ Missing lead_id");
       return res.status(400).json({ error: "Missing lead_id" });
     }
 
+    // 3) Assistant (sesión por lead)
     const result = await processWithAssistant({ text, leadId });
 
+    // 4) Nota en Kommo
     if (result.text) {
       try {
         await postNoteToLead(leadId, result.text);
