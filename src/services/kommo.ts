@@ -1,5 +1,5 @@
 // agent-hub-brain/src/services/kommo.ts
-import axios, { AxiosRequestConfig } from "axios";
+import axios from "axios";
 import { KOMMO_BASE_URL, KOMMO_ACCESS_TOKEN } from "../config.js";
 
 if (!KOMMO_BASE_URL) console.warn("⚠️ KOMMO_BASE_URL no está definido");
@@ -24,7 +24,7 @@ function logRequest(method: "GET" | "POST", url: string, extra?: any) {
   console.log("🔗 KOMMO API", info);
 }
 
-// src/services/kommo.ts (o donde lo tengas)
+/** Publica una nota en un LEAD (formato correcto: array) */
 export async function postNoteToLead(leadId: number, text: string) {
   const url = apiV4Url(`leads/${leadId}/notes`);
   const body = [
@@ -35,6 +35,29 @@ export async function postNoteToLead(leadId: number, text: string) {
   await axios.post(url, body, cfg);
 }
 
+/** (Opcional) Publica una nota en un CONTACTO principal */
+export async function postNoteToContact(contactId: number, text: string) {
+  const url = apiV4Url(`contacts/${contactId}/notes`);
+  const body = [
+    { note_type: "common", params: { text } }
+  ];
+  const cfg = { headers: { ...authHeaders(), "Content-Type": "application/json" } };
+  logRequest("POST", url, { bodyPreview: { note_type: "common", textLen: text.length } });
+  await axios.post(url, body, cfg);
+}
+
+/** Obtiene el contacto principal del lead */
+async function getMainContactIdForLead(leadId: number): Promise<number | null> {
+  const url = apiV4Url(`leads/${leadId}`);
+  const params = { with: "contacts" };
+  logRequest("GET", url, { params });
+  const { data } = await axios.get(url, { params, headers: authHeaders() });
+  const contacts = data?._embedded?.contacts || [];
+  const main = contacts.find((c: any) => c?.is_main) || contacts[0];
+  return main?.id ? Number(main.id) : null;
+}
+
+/** Lee el último mensaje del lead; si no, cae al contacto principal */
 export async function getLatestMessageForLead(leadId: number): Promise<string | null> {
   if (!leadId) return null;
 
@@ -53,7 +76,7 @@ export async function getLatestMessageForLead(leadId: number): Promise<string | 
     console.warn("⚠️ lead.last_message no disponible:", e?.response?.status, e?.response?.data || e?.message);
   }
 
-  // 2) Notas del lead (endpoint anidado)
+  // 2) Notas del LEAD (endpoint anidado)
   try {
     const url = apiV4Url(`leads/${leadId}/notes`);
     const params = { order: "desc", limit: 10 };
@@ -63,15 +86,11 @@ export async function getLatestMessageForLead(leadId: number): Promise<string | 
     console.log("🧾 lead/{id}/notes sample:", notes.slice(0, 2).map((n: any) => ({
       id: n?.id, type: n?.note_type || n?.type, keys: Object.keys(n || {})
     })));
-
-    // Prioriza la nota marcada por el bot
     const mark = notes.find((n: any) => (pickText(n) || "").startsWith("[BOT-MARK]"));
     if (mark) {
       const t = String(pickText(mark)).replace(/^\[BOT-MARK\]\s*/, "").trim();
       if (t) return t;
     }
-
-    // Si no hay marcada, toma la primera con texto
     for (const n of notes) {
       const t = pickText(n);
       if (t && String(t).trim()) return String(t).trim();
@@ -80,7 +99,33 @@ export async function getLatestMessageForLead(leadId: number): Promise<string | 
     console.warn("⚠️ leads/{id}/notes no disponible:", e?.response?.status, e?.response?.data || e?.message);
   }
 
-  // 3) (Opcional) chats/* si tu cuenta lo expone
+  // 3) Fallback: Notas del CONTACTO PRINCIPAL
+  try {
+    const contactId = await getMainContactIdForLead(leadId);
+    if (contactId) {
+      const url = apiV4Url(`contacts/${contactId}/notes`);
+      const params = { order: "desc", limit: 10 };
+      logRequest("GET", url, { params });
+      const { data } = await axios.get(url, { params, headers: authHeaders() });
+      const notes = data?._embedded?.notes || [];
+      console.log("🧾 contact/{id}/notes sample:", notes.slice(0, 2).map((n: any) => ({
+        id: n?.id, type: n?.note_type || n?.type, keys: Object.keys(n || {})
+      })));
+      const mark = notes.find((n: any) => (pickText(n) || "").startsWith("[BOT-MARK]"));
+      if (mark) {
+        const t = String(pickText(mark)).replace(/^\[BOT-MARK\]\s*/, "").trim();
+        if (t) return t;
+      }
+      for (const n of notes) {
+        const t = pickText(n);
+        if (t && String(t).trim()) return String(t).trim();
+      }
+    }
+  } catch (e: any) {
+    console.warn("⚠️ contacts/{id}/notes no disponible:", e?.response?.status, e?.response?.data || e?.message);
+  }
+
+  // 4) (Opcional) chats/* si tu cuenta lo expone
   try {
     const cu = apiV4Url("chats/conversations");
     const cparams = { "filter[lead_id]": leadId, order: "desc", limit: 1 };
@@ -111,3 +156,5 @@ export async function getLatestMessageForLead(leadId: number): Promise<string | 
 
   return null;
 }
+
+export { apiV4Url, authHeaders, logRequest }; // por si los usas en otros lugares
