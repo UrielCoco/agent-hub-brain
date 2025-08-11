@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "vercel dev",
+    "dev": "node -e \"console.log('Usa: npx vrc dev')\"",
     "build": "tsc -p .",
     "start": "echo 'Use Vercel serverless (api routes)'"
   },
