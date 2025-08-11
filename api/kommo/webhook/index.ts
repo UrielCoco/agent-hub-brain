@@ -1,6 +1,7 @@
-import { processWithAssistant } from "../../src/services/openai.js";
-import { postNoteToLead } from "../../src/services/kommo.js";
-import { WEBHOOK_SECRET } from "../../src/config.js";
+// agent-hub-brain/api/kommo/webhook/index.ts
+import { processWithAssistant } from "../../../src/services/openai.js";
+import { postNoteToLead } from "../../../src/services/kommo.js";
+import { WEBHOOK_SECRET } from "../../../src/config.js";
 
 type AnyDict = Record<string, any>;
 
@@ -25,14 +26,12 @@ function maskSecret(s: string | undefined) {
   if (str.length <= 8) return "***";
   return `${str.slice(0, 2)}***${str.slice(-4)}`;
 }
-// parsea application/x-www-form-urlencoded si llega como string
 function parseFormUrlencoded(s: string): AnyDict {
   const out: AnyDict = {};
   const usp = new URLSearchParams(s);
   for (const [k, v] of usp.entries()) out[k] = v;
   return out;
 }
-// busca posibles llaves de texto en payloads raros
 function findTextLoose(obj: AnyDict): string {
   const candidates: string[] = [];
   const push = (v: any) => { if (v) candidates.push(String(v)); };
@@ -43,7 +42,7 @@ function findTextLoose(obj: AnyDict): string {
     push(obj?.note?.text);
     push(obj?.comment?.text);
     push(obj?.last_message?.text);
-    // si viene flat del form-urlencoded:
+    // claves planas típicas cuando viene como form-urlencoded
     for (const k of Object.keys(obj)) {
       const lk = k.toLowerCase();
       if (lk.includes("text") || lk.includes("message")) push(obj[k]);
@@ -58,7 +57,7 @@ function findLeadIdLoose(obj: AnyDict): number {
     cands.push(obj?.conversation?.lead_id);
     cands.push(obj?.lead?.id);
     cands.push(obj?.data?.lead_id);
-    // si viene flat del form-urlencoded:
+    // claves planas típicas
     for (const k of Object.keys(obj)) {
       const lk = k.toLowerCase();
       if (lk.endsWith("lead_id") || lk.endsWith("[lead_id]") || lk.endsWith("[id]")) {
@@ -90,7 +89,7 @@ export default async function handler(req: any, res: any) {
       return res.status(405).json({ error: "Method not allowed" });
     }
 
-    // secret por path o query (plan básico)
+    // Secret por path (/webhook/<SECRET>) o query (?secret=)
     const pathSecret = (() => {
       const m = urlPath.match(/\/api\/kommo\/webhook\/([^/?#]+)/);
       return m?.[1] || "";
@@ -106,24 +105,19 @@ export default async function handler(req: any, res: any) {
       return res.status(401).json({ error: "Unauthorized" });
     }
 
-    // payload: soporta JSON, form-urlencoded, query
+    // Body: soporta JSON y form-urlencoded (string)
     let body: AnyDict = (req.body ?? {}) as AnyDict;
     if (typeof body === "string") {
-      // Vercel a veces entrega el form body como string
       body = parseFormUrlencoded(body);
-    } else if (
-      (!body || Object.keys(body).length === 0) &&
-      typeof req.rawBody === "string"
-    ) {
-      // si existiera rawBody
+    } else if ((!body || Object.keys(body).length === 0) && typeof req.rawBody === "string") {
       body = parseFormUrlencoded(req.rawBody);
     }
 
-    // a) nuestro simple
+    // a) simple
     let text = firstStr(body?.text, req.query?.text);
     let leadId = firstNum(body?.lead_id, req.query?.lead_id);
 
-    // b) formatos Kommo varios (Chats / embudo)
+    // b) formatos Kommo
     if (!text) text = findTextLoose(body);
     if (!leadId) leadId = findLeadIdLoose(body);
 
@@ -142,10 +136,8 @@ export default async function handler(req: any, res: any) {
       return res.status(400).json({ error: "Missing lead_id" });
     }
 
-    // 3) Assistant (sesión por lead)
     const result = await processWithAssistant({ text, leadId });
 
-    // 4) Nota en Kommo
     if (result.text) {
       try {
         await postNoteToLead(leadId, result.text);

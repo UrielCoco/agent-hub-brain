@@ -1,2 +1,1 @@
-export { default, config } from "../webhook";
-
+export { default, config } from "./index";
