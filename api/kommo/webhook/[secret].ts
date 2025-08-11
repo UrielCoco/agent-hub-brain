@@ -1,2 +1,2 @@
-// Re-exporta el handler del index, pero con extensión .js (ESM)
+// agent-hub-brain/api/kommo/webhook/[secret].ts
 export { default, config } from "./index.js";
