@@ -1,8 +1,8 @@
-import type { VercelRequest, VercelResponse } from "@vercel/node";
+// agent-hub-brain/api/assistant/send.ts
 import { processWithAssistant } from "../../src/services/openai.js";
 import { postNoteToLead } from "../../src/services/kommo.js";
 
-export default async function handler(req: VercelRequest, res: VercelResponse) {
+export default async function handler(req: any, res: any) {
   try {
     if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
@@ -19,11 +19,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     const result = await processWithAssistant({ text, sessionId, leadId });
 
-    // Si viene leadId, también publicamos la respuesta en Kommo como nota
     if (leadId && result.text) {
-      try {
-        await postNoteToLead(leadId, result.text);
-      } catch (e) {
+      try { await postNoteToLead(leadId, result.text); } catch (e) {
         console.error("postNoteToLead error:", (e as any)?.response?.data || e);
       }
     }
