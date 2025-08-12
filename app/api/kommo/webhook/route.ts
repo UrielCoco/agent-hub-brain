@@ -12,6 +12,7 @@ function verifySecret(req: NextRequest) {
   const q = req.nextUrl.searchParams.get('secret');
   if (q && q === expected) return { ok: true, from: 'query' as const };
 
+  
   return { ok: false as const, reason: 'mismatch' as const };
 }
 
