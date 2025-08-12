@@ -7,9 +7,25 @@ async function kommoFetch(path: string, init: RequestInit = {}) {
   if (!res.ok) throw new Error(`Kommo ${path} -> ${res.status} ${await res.text().catch(()=> '')}`);
   return res;
 }
-export async function addLeadNote(leadId:number, text:string) {
-  await kommoFetch(`/api/v4/leads/${leadId}/notes`, { method:'POST', body: JSON.stringify([{ note_type:'common', params:{ text } }]) });
+export async function addLeadNote(leadId: number, text: string) {
+  // Crear notas en Kommo v4 es bulk: POST /api/v4/leads/notes
+  const body = [
+    {
+      entity_id: Number(leadId),
+      note_type: 'common',
+      params: { text }
+    }
+  ];
+
+  await kommoFetch(`/api/v4/leads/notes`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+    headers: {
+      'Accept': 'application/json'
+    }
+  });
 }
+
 export async function updateLead(leadId:number, patch:any) {
   const r = await kommoFetch(`/api/v4/leads/${leadId}`, { method:'PATCH', body: JSON.stringify(patch) }); return r.json();
 }

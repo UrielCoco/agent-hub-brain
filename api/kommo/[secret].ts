@@ -36,7 +36,6 @@ export default async function handler(
 
     const { text: answer, threadId } = await sendToAssistant(`kommo:lead:${leadId}`, text);
 
-    // 👇 ahora sí, nota con entity_id
     await addLeadNote(leadId, `(kommo webhook path)\n> Usuario: ${text}\n> Respuesta: ${answer}`);
 
     res.setHeader('Content-Type', 'application/json');
