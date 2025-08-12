@@ -7,11 +7,7 @@ function verifySecret(req: IncomingMessage & { headers: any; url?: string }) {
   if (!expected) return { ok: true, via: 'none' as const };
   const hdr = req.headers['x-webhook-secret'];
   if (typeof hdr === 'string' && hdr === expected) return { ok: true, via: 'header' as const };
-  try {
-    const u = new URL(req.url || '', 'http://localhost');
-    const q = u.searchParams.get('secret');
-    if (q === expected) return { ok: true, via: 'query' as const };
-  } catch {}
+  try { const u=new URL(req.url||'','http://localhost'); const q=u.searchParams.get('secret'); if (q===expected) return { ok:true, via:'query' as const }; } catch {}
   return { ok: false as const };
 }
 
@@ -20,19 +16,13 @@ async function readBody(req: IncomingMessage): Promise<any> {
   const raw = Buffer.concat(chunks);
   const ct = (req.headers['content-type'] || '').toString();
   if (ct.includes('application/json')) { try { return JSON.parse(raw.toString()||'{}'); } catch { return {}; } }
-  if (ct.includes('application/x-www-form-urlencoded')) {
-    const p = new URLSearchParams(raw.toString()); const o:any = {}; for (const [k,v] of p) o[k]=v; return o;
-  }
+  if (ct.includes('application/x-www-form-urlencoded')) { const p=new URLSearchParams(raw.toString()); const o:any={}; for(const[k,v]of p)o[k]=v; return o; }
   try { return JSON.parse(raw.toString()||'{}'); } catch { return {}; }
 }
 
-export default async function handler(
-  req: IncomingMessage & { method?: string; headers: any; url?: string },
-  res: ServerResponse
-) {
+export default async function handler(req: IncomingMessage & { method?: string; headers:any; url?:string }, res: ServerResponse) {
   try {
     if (req.method !== 'POST') { res.statusCode=405; res.end(JSON.stringify({ error:'Method not allowed' })); return; }
-
     const ver = verifySecret(req);
     if (!ver.ok) { res.statusCode=401; res.end(JSON.stringify({ error:'unauthorized', hint:'secret en ?secret= o header x-webhook-secret' })); return; }
 
@@ -40,7 +30,6 @@ export default async function handler(
     const text: string = body?.text ?? body?.message ?? '';
     const leadIdRaw = body?.lead_id ?? body?.leadId;
     const leadId = leadIdRaw ? Number(leadIdRaw) : undefined;
-
     if (!text || !leadId) { res.statusCode=400; res.end(JSON.stringify({ error:'text y lead_id requeridos' })); return; }
 
     const { text: answer } = await sendToAssistant(`kommo:lead:${leadId}`, text);

@@ -2,7 +2,6 @@
   "name": "agent-hub-cerebro",
   "version": "1.0.0",
   "private": true,
-  "type": "module",
   "scripts": {
     "build": "echo build-ok",
     "start": "echo 'Use Vercel serverless (api routes)'"
