@@ -9,6 +9,7 @@ export default async function handler(
   for await (const c of req) chunks.push(c as Buffer);
   const raw = Buffer.concat(chunks).toString();
 
+  
   res.setHeader('Content-Type', 'application/json');
   res.end(JSON.stringify({
     method: req.method,
