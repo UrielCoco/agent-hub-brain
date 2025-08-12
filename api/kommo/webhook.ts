@@ -58,6 +58,16 @@ export default async function handler(
     }
 
     const body = await readBody(req);
+    // IGNORAR webhooks globales de cuenta (no traen texto del chat)
+if (!('text' in body) && !('message' in body)) {
+  // si viene con forma leads[add] / leads[status] lo marcamos como ignorado
+  if (Object.keys(body).some(k => k.startsWith('leads[')) || body['account[subdomain]']) {
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({ ok: true, ignored: 'account_webhook' }));
+    return;
+  }
+}
+
 
     // ============ DEBUG TEMPORAL ============
     try {
