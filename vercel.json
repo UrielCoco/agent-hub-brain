@@ -1,7 +1,5 @@
 {
   "version": 2,
-  "buildCommand": "vercel build",
-  "installCommand": "pnpm install --no-frozen-lockfile",
   "routes": [
     { "src": "/api/kommo/webhook$", "methods": ["POST"], "dest": "/api/kommo/webhook.ts" },
     { "src": "/api/kommo/webhook/(.*)$", "methods": ["POST"], "dest": "/api/kommo/webhook/[secret].ts" }
