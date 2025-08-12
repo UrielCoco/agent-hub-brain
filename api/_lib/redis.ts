@@ -6,7 +6,7 @@ export const redis = new Redis({
   token: process.env.UPSTASH_REDIS_REST_TOKEN!,
 });
 
-// Helpers opcionales
+// Helpers
 export async function kvGet<T = string>(key: string): Promise<T | null> {
   return (await redis.get<T>(key)) ?? null;
 }
@@ -15,6 +15,5 @@ export async function kvSet(key: string, value: string, ttlSec?: number) {
   return redis.set(key, value);
 }
 export async function kvPush(key: string, ...vals: string[]) {
-  // guardamos nuevo al final
   return redis.rpush(key, vals);
 }

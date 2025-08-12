@@ -2,7 +2,7 @@
 import type { IncomingMessage, ServerResponse } from 'http';
 import { sendToAssistant } from '../_lib/assistant';
 import { addLeadNote } from '../_lib/kommo';
-import { kvPush } from '../_lib/redis';
+import { kvPush, redis } from '../_lib/redis';
 
 // --- auth por secret (query o header) ---
 function verifySecret(req: IncomingMessage & { headers: any; url?: string }) {
@@ -43,51 +43,91 @@ export default async function handler(
 ) {
   try {
     if (req.method !== 'POST') {
-      res.statusCode = 405; res.end(JSON.stringify({ error: 'Method not allowed' })); return;
+      res.statusCode = 405;
+      res.setHeader('Content-Type','application/json');
+      res.end(JSON.stringify({ error: 'Method not allowed' }));
+      return;
     }
 
     const ver = verifySecret(req);
     if (!ver.ok) {
       res.statusCode = 401;
+      res.setHeader('Content-Type','application/json');
       res.end(JSON.stringify({ error: 'unauthorized', hint: 'secret en ?secret= o header x-webhook-secret' }));
       return;
     }
 
     const body = await readBody(req);
+
+    // ============ DEBUG TEMPORAL ============
+    try {
+      console.log('[WEBHOOK] headers=', JSON.stringify(req.headers));
+      console.log('[WEBHOOK] url=', req.url);
+      console.log('[WEBHOOK] body=', body);
+    } catch {}
+    // ========================================
+
+    // Campos de interés
     const text: string = body?.text ?? body?.message ?? '';
-    const leadIdRaw = body?.lead_id ?? body?.leadId;
+    const leadIdRaw = body?.lead_id ?? body?.leadId ?? body?.entity_id;
     const leadId: number | undefined = leadIdRaw ? Number(leadIdRaw) : undefined;
 
-    if (!text || !leadId) {
-      res.statusCode = 400; res.end(JSON.stringify({ error: 'text y lead_id requeridos' })); return;
+    if (!text) {
+      res.statusCode = 400;
+      res.setHeader('Content-Type','application/json');
+      res.end(JSON.stringify({ error: 'text requerido' }));
+      return;
     }
 
-    const sessionId = `kommo:lead:${leadId}`;
+    // (Opcional) Rate limit 1s por lead para evitar floods
+    try {
+      if (leadId && redis) {
+        const key = `rl:lead:${leadId}`;
+        const hits = Number((await redis.incr(key)) || 0);
+        if (hits === 1) await redis.expire(key, 1);
+        if (hits > 5) {
+          res.statusCode = 429;
+          res.setHeader('Content-Type','application/json');
+          res.end(JSON.stringify({ error: 'rate_limited' }));
+          return;
+        }
+      }
+    } catch {}
 
-    // Guardamos turno del usuario en Redis
-    await kvPush(`conv:lead:${leadId}`, JSON.stringify({ at: Date.now(), role: 'user', text }));
+    const sessionId = leadId ? `kommo:lead:${leadId}` : `kommo:chat:${body?.chat_id ?? body?.contact_id ?? 'unknown'}`;
 
-    // Llamamos al assistant
+    // Guardamos turno del usuario si hay lead
+    if (leadId) {
+      await kvPush(`conv:lead:${leadId}`, JSON.stringify({ at: Date.now(), role: 'user', text }));
+    }
+
+    // Assistant
     const { text: answer, threadId } = await sendToAssistant(sessionId, text);
 
-    // Guardamos turno del assistant
-    await kvPush(`conv:lead:${leadId}`, JSON.stringify({ at: Date.now(), role: 'assistant', text: answer }));
+    // Guardamos turno del assistant y nota en Kommo si hay lead
+    if (leadId) {
+      await kvPush(`conv:lead:${leadId}`, JSON.stringify({ at: Date.now(), role: 'assistant', text: answer }));
+      try {
+        await addLeadNote(leadId, `(kommo webhook)\n> Usuario: ${text}\n> Respuesta: ${answer}`);
+      } catch (e: any) {
+        console.log('[WEBHOOK] addLeadNote error:', e?.message || e);
+      }
+    }
 
-    // Nota en el lead (útil para auditoría)
-    await addLeadNote(leadId, `(kommo webhook)\n> Usuario: ${text}\n> Respuesta: ${answer}`);
-
-    // Respuesta para Salesbot (usará text_out para enviar al canal)
-    res.setHeader('Content-Type', 'application/json');
+    // Respuesta que utiliza Salesbot
+    res.setHeader('Content-Type','application/json');
     res.end(JSON.stringify({
       ok: true,
       via: ver.via,
-      lead_id: leadId,
+      lead_id: leadId ?? null,
       text_in: text,
       text_out: answer,
       thread_id: threadId
     }));
   } catch (e: any) {
+    console.log('[WEBHOOK] fatal:', e?.message || e);
     res.statusCode = 500;
-    res.end(JSON.stringify({ error: e.message ?? 'Server error' }));
+    res.setHeader('Content-Type','application/json');
+    res.end(JSON.stringify({ error: e?.message ?? 'Server error' }));
   }
 }
