@@ -7,6 +7,7 @@
     "start": "echo 'Use Vercel serverless (api routes)'"
   },
   "dependencies": {
+    "@upstash/redis": "^1.35.3",
     "axios": "^1.7.2",
     "jsonwebtoken": "^9.0.2",
     "openai": "^4.104.0"
