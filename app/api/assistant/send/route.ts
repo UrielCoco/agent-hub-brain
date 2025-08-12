@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { sendToAssistant } from '@/app/lib/assistant';
-import { addLeadNote } from '@/app/lib/kommo';
+import { sendToAssistant } from '../../../lib/assistant';
+import { addLeadNote } from '../../../lib/kommo';
 
 export async function POST(req: NextRequest) {
   try {

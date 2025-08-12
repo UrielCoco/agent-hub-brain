@@ -1,18 +1,17 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { sendToAssistant } from '@/app/lib/assistant';
-import { addLeadNote } from '@/app/lib/kommo';
+import { sendToAssistant } from '../../../lib/assistant';
+import { addLeadNote } from '../../../lib/kommo';
 
 function verifySecret(req: NextRequest) {
   const expected = process.env.WEBHOOK_SECRET;
-  if (!expected) return { ok: true, from: 'no-secret-configured' as const };
+  if (!expected) return { ok: true as const, from: 'no-secret-configured' as const };
 
   const header = req.headers.get('x-webhook-secret');
-  if (header && header === expected) return { ok: true, from: 'header' as const };
+  if (header && header === expected) return { ok: true as const, from: 'header' as const };
 
   const q = req.nextUrl.searchParams.get('secret');
-  if (q && q === expected) return { ok: true, from: 'query' as const };
+  if (q && q === expected) return { ok: true as const, from: 'query' as const };
 
-  
   return { ok: false as const, reason: 'mismatch' as const };
 }
 
