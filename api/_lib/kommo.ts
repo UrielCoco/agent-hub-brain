@@ -1,14 +1,17 @@
 const BASE = process.env.KOMMO_BASE_URL!;
 const AUTH = `Bearer ${process.env.KOMMO_ACCESS_TOKEN!}`;
 
-function must(v?: string, name?: string) { if (!v) throw new Error(`Falta variable: ${name}`); return v; }
+function must(v?: string, name?: string) {
+  if (!v) throw new Error(`Falta variable: ${name}`);
+  return v;
+}
 
 async function kommoFetch(path: string, init: RequestInit = {}) {
   must(BASE,'KOMMO_BASE_URL'); must(AUTH,'KOMMO_ACCESS_TOKEN');
   const url = path.startsWith('http') ? path : `${BASE}${path}`;
   const res = await fetch(url, {
     ...init,
-    headers: { 'Authorization': AUTH, 'Content-Type': 'application/json', ...(init.headers||{}) },
+    headers: { 'Authorization': AUTH, 'Content-Type': 'application/json', ...(init.headers || {}) },
     cache: 'no-store'
   });
   if (!res.ok) {
