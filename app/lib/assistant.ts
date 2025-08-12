@@ -2,10 +2,9 @@ import OpenAI from 'openai';
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY!;
 const OPENAI_ASSISTANT_ID = process.env.OPENAI_ASSISTANT_ID!;
-
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-// Almacenamiento simple en memoria (prod: cambia a Redis/DB)
+// memoria simple (prod: usa Redis/DB)
 const mem = new Map<string, string>();
 
 export async function sendToAssistant(sessionId: string, userText: string) {
@@ -19,10 +18,8 @@ export async function sendToAssistant(sessionId: string, userText: string) {
   }
 
   await openai.beta.threads.messages.create(threadId, { role: 'user', content: userText });
-
   const run = await openai.beta.threads.runs.create(threadId, { assistant_id: OPENAI_ASSISTANT_ID });
 
-  // Polling sencillo (sin tools)
   let status = run.status;
   while (status === 'queued' || status === 'in_progress') {
     const r = await openai.beta.threads.runs.retrieve(threadId, run.id);
