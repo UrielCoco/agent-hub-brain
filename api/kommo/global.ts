@@ -1,4 +1,4 @@
-// /api/kommo/global.ts
+// /api/kommo/global.ts  — v4
 import type { IncomingMessage, ServerResponse } from 'http';
 import { sendToAssistant } from '../_lib/assistant';
 import { addLeadNote } from '../_lib/kommo';
@@ -75,8 +75,8 @@ export default async function handler(
     }
 
     const { raw, parsed, ct } = await readForm(req);
-    console.info('[GLOBAL] meta', { ct, rawPreview: raw.slice(0, 200) });
-    console.info('[GLOBAL] keys', Object.keys(parsed));
+    console.info('[GLOBAL v4] meta', { ct, rawPreview: raw.slice(0, 200) });
+    console.info('[GLOBAL v4] keys', Object.keys(parsed));
 
     // ---- EXTRAER MENSAJE (tu cuenta envía message[add]...) ----
     const text =
@@ -100,26 +100,36 @@ export default async function handler(
        get<string>(parsed, 'messages[add][0][author][type]') || '')
        .toLowerCase();
 
+    // dirección del mensaje (in/out), útil para evitar loops
+    const direction =
+      (get<string>(parsed, 'message[add][0][type]') ||
+       get<string>(parsed, 'messages[add][0][type]') || '')
+       .toLowerCase();
+
     const leadIdStr =
       get<string>(parsed, 'message[add][0][entity_id]') ||
       get<string>(parsed, 'messages[add][0][entity_id]') ||
       get<string>(parsed, 'lead[id]') ||
       get<string>(parsed, 'lead_id');
 
-    // Logs de extracción (clave para depurar diferencias entre cuentas)
-    console.info('[GLOBAL] extracted', { authorType, chatId, talkId, leadIdStr, textPreview: (text||'').slice(0,160) });
+    console.info('[GLOBAL v4] extracted', {
+      authorType, direction, chatId, talkId, leadIdStr, textPreview: (text||'').slice(0,160)
+    });
 
-    // Procesa solo mensajes del cliente; si viene vacío, igual procesamos
-    const isContact = !authorType || authorType === 'contact';
-    if (!isContact) {
-      console.info('[GLOBAL] ignored:not_contact', { authorType });
+    // === LÓGICA DE FILTRO (ACEPTA external/contact/client/visitor o type=in) ===
+    const inboundByDirection = direction === 'in';
+    const inboundByAuthor = ['external', 'contact', 'client', 'visitor'].includes(authorType);
+    const isInbound = inboundByDirection || inboundByAuthor;
+
+    if (!isInbound) {
+      console.info('[GLOBAL v4] ignored:not_inbound', { authorType, direction });
       res.statusCode = 200; res.setHeader('Content-Type','application/json');
-      res.end(JSON.stringify({ ok:true, ignored:'not_contact_message', authorType }));
+      res.end(JSON.stringify({ ok:true, ignored:'not_inbound', authorType, direction }));
       return;
     }
 
     if (!text || (!chatId && !talkId)) {
-      console.info('[GLOBAL] ignored:missing_fields', { haveText: !!text, chatId, talkId });
+      console.info('[GLOBAL v4] ignored:missing_fields', { haveText: !!text, chatId, talkId });
       res.statusCode = 200; res.setHeader('Content-Type','application/json');
       res.end(JSON.stringify({ ok:true, ignored:'not_a_message', haveText: !!text, chatId, talkId }));
       return;
@@ -127,28 +137,28 @@ export default async function handler(
 
     const leadId = leadIdStr ? Number(leadIdStr) : undefined;
     const sessionId = leadId ? `kommo:lead:${leadId}` : `kommo:chat:${chatId || talkId}`;
-    console.info('[GLOBAL] in', { sessionId });
+    console.info('[GLOBAL v4] in', { sessionId });
 
     // Assistant
     const { text: answer, threadId } = await sendToAssistant(sessionId, text);
-    console.info('[GLOBAL] out', { threadId, answerPreview: answer.slice(0, 200) });
+    console.info('[GLOBAL v4] out', { threadId, answerPreview: answer.slice(0, 200) });
 
     // Enviar respuesta (Chats o Talks)
     if (chatId) {
       await sendChatMessage(chatId, answer);
-      console.info('[GLOBAL] msg_sent:chat', { chatId });
+      console.info('[GLOBAL v4] msg_sent:chat', { chatId });
     } else if (talkId) {
       await sendTalkMessage(talkId, answer);
-      console.info('[GLOBAL] msg_sent:talk', { talkId });
+      console.info('[GLOBAL v4] msg_sent:talk', { talkId });
     }
 
     // Nota en lead (si hay)
     if (leadId) {
       try {
         await addLeadNote(leadId, `(kommo global)\n> Usuario: ${text}\n> Respuesta: ${answer}`);
-        console.info('[GLOBAL] note_ok', { leadId });
+        console.info('[GLOBAL v4] note_ok', { leadId });
       } catch (e: any) {
-        console.warn('[GLOBAL] note_err', e?.message || e);
+        console.warn('[GLOBAL v4] note_err', e?.message || e);
       }
     }
 
@@ -156,7 +166,7 @@ export default async function handler(
     res.setHeader('Content-Type','application/json');
     res.end(JSON.stringify({ ok:true, chat_id: chatId ?? null, talk_id: talkId ?? null, lead_id: leadId ?? null }));
   } catch (e: any) {
-    console.error('[GLOBAL] fatal', e?.message || e);
+    console.error('[GLOBAL v4] fatal', e?.message || e);
     res.statusCode = 200; // no reintentos en loop
     res.end(JSON.stringify({ ok:false, error: e?.message || 'error' }));
   }
