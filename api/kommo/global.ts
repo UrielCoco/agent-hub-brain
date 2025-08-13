@@ -3,7 +3,7 @@ import type { IncomingMessage, ServerResponse } from 'http';
 import { sendToAssistant } from '../_lib/assistant';
 import { addLeadNote } from '../_lib/kommo';
 
-const BASE = process.env.KOMMO_BASE_URL!;
+const BASE = process.env.KOMMO_BASE_URL!;          // ej: https://contactcocovolarecom.amocrm.com
 const AUTH = `Bearer ${process.env.KOMMO_ACCESS_TOKEN!}`;
 
 function get<T = string>(o: Record<string, any>, k: string): T | undefined {
@@ -38,21 +38,24 @@ async function kommoFetch(path: string, init: RequestInit = {}) {
     },
     cache: 'no-store',
   });
-  if (!res.ok) {
-    const t = await res.text().catch(()=>'');
-    throw new Error(`Kommo ${path} -> ${res.status} ${t}`);
-  }
-  return res.json().catch(() => ({}));
+  const text = await res.text().catch(()=>'');
+  if (!res.ok) throw new Error(`Kommo ${path} -> ${res.status} ${text}`);
+  try { return JSON.parse(text); } catch { return {}; }
 }
 
-// Enviar respuesta al mismo chat (WhatsApp/Instagram/Webchat)
+// Envío por Chats API (chat_id)
 async function sendChatMessage(chatId: string, text: string) {
   return kommoFetch('/api/v4/chats/messages', {
     method: 'POST',
-    body: JSON.stringify({
-      chat_id: chatId,
-      message: { text },
-    }),
+    body: JSON.stringify({ chat_id: chatId, message: { text } }),
+  });
+}
+
+// Fallback: Talks API (talk_id)
+async function sendTalkMessage(talkId: string, text: string) {
+  return kommoFetch('/api/v4/talks/messages', {
+    method: 'POST',
+    body: JSON.stringify({ talk_id: talkId, message: { text } }),
   });
 }
 
@@ -61,17 +64,13 @@ export default async function handler(
   res: ServerResponse
 ) {
   try {
-    if (req.method !== 'POST') {
-      res.statusCode = 405; res.end('Method not allowed'); return;
-    }
+    if (req.method !== 'POST') { res.statusCode = 405; res.end('Method not allowed'); return; }
 
-    // Auth opcional con secret (query o header)
+    // Auth opcional
     const expected = process.env.WEBHOOK_SECRET;
     if (expected) {
       const u = new URL(req.url || '', 'http://localhost');
-      const ok =
-        u.searchParams.get('secret') === expected ||
-        req.headers['x-webhook-secret'] === expected;
+      const ok = u.searchParams.get('secret') === expected || req.headers['x-webhook-secret'] === expected;
       if (!ok) { res.statusCode = 401; res.end('unauthorized'); return; }
     }
 
@@ -79,11 +78,10 @@ export default async function handler(
     console.info('[GLOBAL] meta', { ct, rawPreview: raw.slice(0, 200) });
     console.info('[GLOBAL] keys', Object.keys(parsed));
 
-    // ====== EXTRAER MENSAJE (singular o plural) ======
-    // Tu cuenta está enviando "message[add][0][...]" (singular).
+    // ---- EXTRAER MENSAJE (tu cuenta envía message[add]...) ----
     const text =
       get<string>(parsed, 'message[add][0][text]') ||
-      get<string>(parsed, 'messages[add][0][text]') || // fallback por si cambia
+      get<string>(parsed, 'messages[add][0][text]') ||
       get<string>(parsed, 'message[text]') ||
       get<string>(parsed, 'text');
 
@@ -98,53 +96,53 @@ export default async function handler(
       get<string>(parsed, 'messages[add][0][talk_id]');
 
     const authorType =
-      get<string>(parsed, 'message[add][0][author][type]') ||
-      get<string>(parsed, 'messages[add][0][author][type]');
+      (get<string>(parsed, 'message[add][0][author][type]') ||
+       get<string>(parsed, 'messages[add][0][author][type]') || '')
+       .toLowerCase();
 
-    // lead (si viene, lo usamos para nota/contexto; no es obligatorio)
     const leadIdStr =
-      get<string>(parsed, 'message[add][0][entity_id]') || // a veces mapea al lead
+      get<string>(parsed, 'message[add][0][entity_id]') ||
       get<string>(parsed, 'messages[add][0][entity_id]') ||
       get<string>(parsed, 'lead[id]') ||
       get<string>(parsed, 'lead_id');
 
-    // Procesamos SOLO si es mensaje del cliente (no del manager)
-    // En Kommo, suele ser "contact" para cliente y "user" para manager.
-    if (authorType && authorType.toLowerCase() !== 'contact') {
-      res.statusCode = 200;
-      res.setHeader('Content-Type', 'application/json');
-      res.end(JSON.stringify({ ok: true, ignored: 'not_contact_message', authorType }));
+    // Logs de extracción (clave para depurar diferencias entre cuentas)
+    console.info('[GLOBAL] extracted', { authorType, chatId, talkId, leadIdStr, textPreview: (text||'').slice(0,160) });
+
+    // Procesa solo mensajes del cliente; si viene vacío, igual procesamos
+    const isContact = !authorType || authorType === 'contact';
+    if (!isContact) {
+      console.info('[GLOBAL] ignored:not_contact', { authorType });
+      res.statusCode = 200; res.setHeader('Content-Type','application/json');
+      res.end(JSON.stringify({ ok:true, ignored:'not_contact_message', authorType }));
       return;
     }
 
-    if (!text || !(chatId || talkId)) {
-      res.statusCode = 200;
-      res.setHeader('Content-Type', 'application/json');
-      res.end(JSON.stringify({ ok: true, ignored: 'not_a_message', haveText: !!text, chatId, talkId }));
+    if (!text || (!chatId && !talkId)) {
+      console.info('[GLOBAL] ignored:missing_fields', { haveText: !!text, chatId, talkId });
+      res.statusCode = 200; res.setHeader('Content-Type','application/json');
+      res.end(JSON.stringify({ ok:true, ignored:'not_a_message', haveText: !!text, chatId, talkId }));
       return;
     }
 
     const leadId = leadIdStr ? Number(leadIdStr) : undefined;
     const sessionId = leadId ? `kommo:lead:${leadId}` : `kommo:chat:${chatId || talkId}`;
-
-    console.info('[GLOBAL] in', { textPreview: text.slice(0, 160), chatId, talkId, leadId });
+    console.info('[GLOBAL] in', { sessionId });
 
     // Assistant
     const { text: answer, threadId } = await sendToAssistant(sessionId, text);
     console.info('[GLOBAL] out', { threadId, answerPreview: answer.slice(0, 200) });
 
-    // Responder al mismo chat
+    // Enviar respuesta (Chats o Talks)
     if (chatId) {
       await sendChatMessage(chatId, answer);
-      console.info('[GLOBAL] msg_sent', { chatId });
-    } else {
-      // Si por alguna razón solo viene talkId, aquí podríamos
-      // implementar /api/v4/talks/messages. Tu payload trae ambos,
-      // así que no hace falta por ahora.
-      console.warn('[GLOBAL] no_chat_id', { talkId });
+      console.info('[GLOBAL] msg_sent:chat', { chatId });
+    } else if (talkId) {
+      await sendTalkMessage(talkId, answer);
+      console.info('[GLOBAL] msg_sent:talk', { talkId });
     }
 
-    // Nota en lead (si existe)
+    // Nota en lead (si hay)
     if (leadId) {
       try {
         await addLeadNote(leadId, `(kommo global)\n> Usuario: ${text}\n> Respuesta: ${answer}`);
@@ -155,12 +153,11 @@ export default async function handler(
     }
 
     res.statusCode = 200;
-    res.setHeader('Content-Type', 'application/json');
-    res.end(JSON.stringify({ ok: true, chat_id: chatId ?? null, talk_id: talkId ?? null, lead_id: leadId ?? null }));
+    res.setHeader('Content-Type','application/json');
+    res.end(JSON.stringify({ ok:true, chat_id: chatId ?? null, talk_id: talkId ?? null, lead_id: leadId ?? null }));
   } catch (e: any) {
     console.error('[GLOBAL] fatal', e?.message || e);
-    // 200 para que Kommo no reintente en loop
-    res.statusCode = 200;
-    res.end(JSON.stringify({ ok: false, error: e?.message || 'error' }));
+    res.statusCode = 200; // no reintentos en loop
+    res.end(JSON.stringify({ ok:false, error: e?.message || 'error' }));
   }
 }
