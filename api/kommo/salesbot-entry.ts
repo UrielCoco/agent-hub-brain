@@ -35,12 +35,15 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     log.debug("entry:context", { subdomain, botId, continueId, hasReturnUrl: !!returnUrl });
 
     // 1) Respuesta del assistant (tu otro proyecto)
-    const reply = await getAssistantReply(String(userMsg || ""), {
-      leadId: data?.lead_id || body?.lead_id,
-      contactId: data?.contact_id || body?.contact_id,
-      talkId: data?.talk_id || body?.talk_id,
-      traceId,
-    });
+const reply = "ENTRY▶ " + (
+  await getAssistantReply(String(userMsg || ""), {
+    leadId: data?.lead_id || body?.lead_id,
+    contactId: data?.contact_id || body?.contact_id,
+    talkId: data?.talk_id || body?.talk_id,
+    traceId,
+  })
+);
+
     log.info("assistant:reply", { preview: String(reply).slice(0,160) });
 
     // 2) Nota en lead (opcional)
