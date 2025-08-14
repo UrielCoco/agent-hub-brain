@@ -119,7 +119,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     // MODO 1: Private Chatbot (Kommo nos manda return_url)
     if (returnUrl) {
-      await postReturn(returnUrl, payload, traceId);
+      
       return res.status(200).json({ status: "ok", traceId });
     }
 
