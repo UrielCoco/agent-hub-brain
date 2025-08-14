@@ -8,6 +8,7 @@ import { getAssistantReply } from "../_lib/assistant";
 // (opcional) limita tamaño del body
 export const config = { api: { bodyParser: { sizeLimit: "1mb" } } };
 
+
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   try {
     // 1) Ack inmediato para que Kommo no corte la llamada
