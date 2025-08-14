@@ -115,7 +115,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     if (!bot_id || !continue_id) {
       const payload = {
         data: { status: "success" },
+        reply,
         execute_handlers: [{ handler: "show", params: { type: "text", value: reply.slice(0, 800) } }],
+        
       };
       if (!res.writableEnded) return res.status(200).json(payload);
       return;
