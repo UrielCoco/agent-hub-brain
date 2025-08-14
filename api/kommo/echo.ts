@@ -17,6 +17,7 @@ function log(
   );
 }
 
+
 /** Intenta normalizar el body venga como JSON o x-www-form-urlencoded */
 function normalizeBody(req: VercelRequest) {
   const ct = String(req.headers["content-type"] || "");
