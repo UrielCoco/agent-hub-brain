@@ -1,47 +1,52 @@
-// pages/api/kommo/salesbot-hook.js
-// Recibe widget_request del Salesbot, obtiene respuesta del Assistant
-// y reanuda el Salesbot (continue o return_url).
+// agent-hub-brain-main/api/kommo/salesbot-hook.ts
+// Recibe widget_request del Salesbot → llama al Assistant → reanuda el bot (continue o return_url).
 
-import { continueSalesbot, continueViaReturnUrl, cleanSubdomain } from "../../../lib/kommo";
-import { getAssistantReply } from "../../../lib/assistant";
+import type { VercelRequest, VercelResponse } from "@vercel/node";
+import { continueSalesbot, continueViaReturnUrl, cleanSubdomain } from "../_lib/kommo";
+import { getAssistantReply } from "../_lib/assistant";
 
-export default async function handler(req, res) {
+// (opcional) limita tamaño del body
+export const config = { api: { bodyParser: { sizeLimit: "1mb" } } };
+
+export default async function handler(req: VercelRequest, res: VercelResponse) {
   try {
-    // Ack inmediato para que Kommo no timeoutee
-    res.status(200).json({ ok: true });
+    // 1) Ack inmediato para que Kommo no corte la llamada
+    if (!res.writableEnded) res.status(200).json({ ok: true });
 
-    const body = req.body || {};
-    const account = body.account || {};
+    // 2) Desempaqueta payload del widget_request
+    const body: any = req.body || {};
     const subdomain = cleanSubdomain(
-      account.subdomain || process.env.KOMMO_SUBDOMAIN || ""
+      body?.account?.subdomain || process.env.KOMMO_SUBDOMAIN || ""
     );
+    const botId = body?.bot_id || body?.bot?.id;
+    const continueId = body?.continue_id || body?.bot?.continue_id;
+    const returnUrl = body?.return_url;
 
-    const botId = body.bot_id || body.bot?.id;
-    const continueId = body.continue_id || body.bot?.continue_id;
-    const returnUrl = body.return_url;
-
-    // Datos enviados desde el bloque (script del widget)
-    const data = body.data || {};
+    const data = body?.data || {};
     const userMsg =
-      data.message || data.message_text || body.message || body.message_text || "";
+      data?.message ||
+      data?.message_text ||
+      body?.message ||
+      body?.message_text ||
+      "";
 
-    // 1) Llama a tu servicio de Assistant (o usa fallback)
+    // 3) Llama a tu Assistant
     const reply = await getAssistantReply(userMsg, {
-      leadId: data.lead_id || body.lead_id,
-      contactId: data.contact_id || body.contact_id,
-      talkId: data.talk_id || body.talk_id,
+      leadId: data?.lead_id || body?.lead_id,
+      contactId: data?.contact_id || body?.contact_id,
+      talkId: data?.talk_id || body?.talk_id,
     });
 
-    // 2) Reanuda el Salesbot: preferimos Continue si hay token + ids
+    // 4) Reanuda el Salesbot (preferimos continue con token)
     let delivered = false;
 
     if (botId && continueId && process.env.KOMMO_ACCESS_TOKEN) {
       try {
         await continueSalesbot({
           subdomain,
-          accessToken: process.env.KOMMO_ACCESS_TOKEN,
-          botId,
-          continueId,
+          accessToken: process.env.KOMMO_ACCESS_TOKEN!,
+          botId: String(botId),
+          continueId: String(continueId),
           text: reply,
         });
         delivered = true;
@@ -50,7 +55,7 @@ export default async function handler(req, res) {
       }
     }
 
-    // 3) Fallback a return_url (también oficial)
+    // 5) Fallback: return_url
     if (!delivered && returnUrl) {
       try {
         await continueViaReturnUrl(returnUrl, { status: "success", reply });
@@ -66,7 +71,7 @@ export default async function handler(req, res) {
       );
     }
   } catch (err) {
-    // Ya enviamos 200 arriba; aquí sólo log
     console.error("[salesbot-hook] fatal:", err);
+    if (!res.writableEnded) res.status(200).json({ ok: true });
   }
 }
