@@ -1,35 +1,52 @@
-// /api/_lib/kommo.ts
-const BASE = process.env.KOMMO_BASE_URL!;
-const AUTH = `Bearer ${process.env.KOMMO_ACCESS_TOKEN!}`;
+// lib/kommo.js
+// Utilidades para continuar el Salesbot y fallback por return_url
 
-async function kommoFetch(path: string, init: RequestInit = {}) {
-  const url = path.startsWith('http') ? path : `${BASE}${path}`;
-  const res = await fetch(url, {
-    ...init,
-    headers: {
-      'Authorization': AUTH,
-      'Content-Type': 'application/json',
-      'Accept': 'application/json',
-      ...(init.headers || {})
-    },
-    cache: 'no-store'
-  });
-  if (!res.ok) {
-    const txt = await res.text().catch(() => '');
-    throw new Error(`Kommo ${path} -> ${res.status} ${txt}`);
+export function cleanSubdomain(value) {
+  if (!value) return "";
+  // quita https:// y dominio
+  return String(value)
+    .replace(/^https?:\/\//, "")
+    .replace(/\.amocrm\.com.*$/i, "")
+    .replace(/\/.*$/, "");
+}
+
+export async function continueSalesbot({ subdomain, accessToken, botId, continueId, text }) {
+  if (!subdomain || !accessToken || !botId || !continueId) {
+    throw new Error("continueSalesbot: faltan parámetros");
   }
-  return res;
+  const url = `https://${subdomain}.kommo.com/api/v4/salesbot/${botId}/continue/${continueId}`;
+
+  const body = {
+    // Esto aparece en {{json.*}} si lo necesitas
+    data: { status: "success", reply: text },
+    // Y aquí pedimos que el bot "muestre" el texto al cliente
+    execute_handlers: [{ handler: "show", params: { text } }],
+  };
+
+  const r = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!r.ok) {
+    const errText = await r.text().catch(() => "");
+    throw new Error(`Salesbot continue failed ${r.status}: ${errText}`);
+  }
 }
 
-export async function addLeadNote(leadId: number, text: string) {
-  // Crear notas (bulk) en Kommo v4
-  const body = [
-    { entity_id: Number(leadId), note_type: 'common', params: { text } }
-  ];
-  await kommoFetch(`/api/v4/leads/notes`, { method: 'POST', body: JSON.stringify(body) });
-}
-
-export async function updateLead(leadId: number, patch: any) {
-  const r = await kommoFetch(`/api/v4/leads/${leadId}`, { method: 'PATCH', body: JSON.stringify(patch) });
-  return r.json();
+export async function continueViaReturnUrl(returnUrl, dataObj) {
+  const r = await fetch(returnUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    // La spec pide un objeto con "data"
+    body: JSON.stringify({ data: dataObj }),
+  });
+  if (!r.ok) {
+    const errText = await r.text().catch(() => "");
+    throw new Error(`return_url failed ${r.status}: ${errText}`);
+  }
 }
