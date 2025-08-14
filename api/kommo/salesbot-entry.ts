@@ -43,7 +43,6 @@ const reply = "ENTRY▶ " + (
     traceId,
   })
 );
-
     log.info("assistant:reply", { preview: String(reply).slice(0,160) });
 
     // 2) Nota en lead (opcional)
