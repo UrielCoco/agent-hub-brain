@@ -13,14 +13,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const ct = String(req.headers["content-type"] || "");
     const body: any = req.body || {};
     const keys = Object.keys(body || {});
-    log.info("entry:received", { ct, keys });
+    log.info("entry:received", { path: req.url, method: req.method, ct, keys });
 
-    // Si por error llega un payload del Webhook Global, lo ignoramos explícitamente
+    // Si por error llega payload del Webhook Global, ignóralo
     const looksGlobal = typeof body["message[add][0][text]"] !== "undefined";
     if (looksGlobal) {
-      log.warn("entry:got_global_payload", {
-        hint: "Este endpoint es SOLO para widget_request/Widget del Salesbot. Revisa el bot."
-      });
+      log.warn("entry:got_global_payload", { hint: "Este endpoint es SOLO para widget_request/Widget." });
       return res.status(200).json({ status: "fail", reply: "" });
     }
 
@@ -34,25 +32,20 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     log.info("entry:userMsg", { preview: String(userMsg).slice(0,160) });
     log.debug("entry:context", { subdomain, botId, continueId, hasReturnUrl: !!returnUrl });
 
-    // 1) Respuesta del assistant (tu otro proyecto)
-const reply = "ENTRY▶ " + (
-  await getAssistantReply(String(userMsg || ""), {
-    leadId: data?.lead_id || body?.lead_id,
-    contactId: data?.contact_id || body?.contact_id,
-    talkId: data?.talk_id || body?.talk_id,
-    traceId,
-  })
-);
+    const reply = "ENTRY▶ " + (await getAssistantReply(String(userMsg || ""), {
+      leadId: data?.lead_id || body?.lead_id,
+      contactId: data?.contact_id || body?.contact_id,
+      talkId: data?.talk_id || body?.talk_id,
+      traceId,
+    }));
     log.info("assistant:reply", { preview: String(reply).slice(0,160) });
 
-    // 2) Nota en lead (opcional)
     const leadId = Number(data?.lead_id || body?.lead_id || 0);
     if (leadId) {
       try { await addLeadNote(leadId, `🤖 Assistant: ${reply}`, traceId); }
       catch (e: any) { log.warn("lead:note:fail", { err: e?.message || String(e) }); }
     }
 
-    // 3) Entregar al usuario (continue preferido; fallback return_url)
     let delivered = false;
     if (botId && continueId && process.env.KOMMO_ACCESS_TOKEN) {
       try {
@@ -81,18 +74,13 @@ const reply = "ENTRY▶ " + (
       }
     }
 
-    if (!delivered) {
-      log.error("deliver:failed", { hint: "Este endpoint debe ser llamado SOLO por Salesbot (widget_request/Widget)." });
-    } else {
-      log.info("deliver:ok");
-    }
+    if (!delivered) log.error("deliver:failed");
+    else log.info("deliver:ok");
 
-    // 4) Además devolvemos JSON para que {{json.reply}} funcione si lo usas
+    // También devolvemos JSON por si usas {{json.reply}}
     return res.status(200).json({ status: "success", reply, traceId });
-
   } catch (err: any) {
-    const log2 = mkLogger(traceId);
-    log2.error("entry:fatal", { err: err?.message || String(err) });
+    mkLogger(traceId).error("entry:fatal", { err: err?.message || String(err) });
     return res.status(200).json({ status: "fail", reply: "" });
   }
 }
