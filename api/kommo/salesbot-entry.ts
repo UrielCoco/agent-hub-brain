@@ -1,9 +1,66 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { mkLogger, genTraceId } from "../_lib/logger";
-import { continueSalesbot, continueViaReturnUrl, cleanSubdomain, addLeadNote } from "../_lib/kommo";
-import { getAssistantReply } from "../_lib/assistant";
+
+/**
+ * Este endpoint es llamado por el Salesbot (Código personalizado → widget_request).
+ * - Si NO llegan bot_id/continue_id: devolvemos execute_handlers para que Kommo muestre la respuesta en el chat.
+ * - Si SÍ llegan (modo Widget): intentamos continue (requiere token OAuth), y también devolvemos JSON.
+ */
 
 export const config = { api: { bodyParser: { sizeLimit: "2mb" } } };
+
+async function getAssistantReply(message: string, ctx: { leadId?: string; contactId?: string; traceId: string }) {
+  // Llama a tu backend del assistant (proyecto coco-volare-ai-chat-main)
+  const base = process.env.ASSISTANT_BASE_URL; // ej: https://coco-volare-ai-chat.vercel.app
+  if (!base) return "¡Hola! ¿En qué puedo ayudarte hoy?";
+  const url = `${base.replace(/\/+$/,"")}/api/reply`;
+
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      message,
+      leadId: ctx.leadId,
+      contactId: ctx.contactId,
+      traceId: ctx.traceId,
+    }),
+  });
+  const data = await resp.json().catch(() => ({}));
+  return (data?.reply || "¡Listo!").toString();
+}
+
+async function continueSalesbot(opts: {
+  subdomain: string;
+  botId: string;
+  continueId: string;
+  reply: string;
+  traceId: string;
+}) {
+  const log = mkLogger(opts.traceId);
+  const token = process.env.KOMMO_OAUTH_ACCESS_TOKEN; // Opcional (requerido sólo para "Widget")
+  if (!token) {
+    log.warn("continue:skip", { reason: "missing_token" });
+    return false;
+  }
+  const url = `https://${opts.subdomain}.kommo.com/api/v4/salesbot/${opts.botId}/continue/${opts.continueId}`;
+  log.info("continueSalesbot → POST", { url, textPreview: opts.reply.slice(0, 160) });
+  const r = await fetch(url, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({
+      data: { status: "success" },
+      execute_handlers: [
+        { handler: "show", params: { type: "text", value: opts.reply.slice(0, 800) } },
+      ],
+    }),
+  });
+  const preview = await r.text();
+  log.info("continueSalesbot ← resp", { status: r.status, len: preview.length, preview: preview.slice(0, 160) });
+  return r.ok;
+}
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   const traceId = (req.headers["x-trace-id"] as string) || genTraceId();
@@ -11,76 +68,87 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   try {
     const ct = String(req.headers["content-type"] || "");
-    const body: any = req.body || {};
-    const keys = Object.keys(body || {});
-    log.info("entry:received", { path: req.url, method: req.method, ct, keys });
+    const body: any =
+      ct.includes("application/json")
+        ? req.body
+        : ct.includes("application/x-www-form-urlencoded")
+        ? Object.fromEntries(new URLSearchParams(String(req.body || "")).entries())
+        : req.body || {};
 
-    // Si por error llega payload del Webhook Global, ignóralo
-    const looksGlobal = typeof body["message[add][0][text]"] !== "undefined";
-    if (looksGlobal) {
-      log.warn("entry:got_global_payload", { hint: "Este endpoint es SOLO para widget_request/Widget." });
-      return res.status(200).json({ status: "fail", reply: "" });
+    const { account = {}, data = {}, bot_id, continue_id, return_url } = body || {};
+
+    log.info("entry:received", {
+      path: req.url,
+      method: req.method,
+      ct,
+      keys: Object.keys(body || {}),
+    });
+
+    // Detectar si por error llegó Global
+    if (typeof body["message[add][0][text]"] !== "undefined") {
+      log.warn("entry:got_global_payload", {
+        hint:
+          "Este endpoint es SOLO para widget_request/Widget del Salesbot. Deja el Webhook Global en /api/kommo/global",
+      });
+      if (!res.writableEnded) return res.status(200).json({ data: { status: "skip" } });
+      return;
     }
 
-    const subdomain = cleanSubdomain(body?.account?.subdomain || process.env.KOMMO_SUBDOMAIN || "");
-    const botId      = body?.bot_id || body?.bot?.id;
-    const continueId = body?.continue_id || body?.bot?.continue_id;
-    const returnUrl  = body?.return_url;
+    const userMsg =
+      data?.message ??
+      data?.message_text ??
+      body?.message ??
+      body?.message_text ??
+      "";
+    const subdomain = (account?.subdomain || process.env.KOMMO_SUBDOMAIN || "").replace(/^https?:\/\/|\.amocrm\.com|\.kommo\.com/gi, "");
+    const leadId = data?.lead_id || body?.lead_id;
+    const contactId = data?.contact_id || body?.contact_id;
 
-    const data    = body?.data || {};
-    const userMsg = data?.message || data?.message_text || body?.message || body?.message_text || "";
-    log.info("entry:userMsg", { preview: String(userMsg).slice(0,160) });
-    log.debug("entry:context", { subdomain, botId, continueId, hasReturnUrl: !!returnUrl });
+    log.info("entry:userMsg", { preview: String(userMsg || "").slice(0, 160) });
+    log.debug?.("entry:context", { subdomain, bot_id, continue_id, hasReturnUrl: !!return_url });
 
-    const reply = "ENTRY▶ " + (await getAssistantReply(String(userMsg || ""), {
-      leadId: data?.lead_id || body?.lead_id,
-      contactId: data?.contact_id || body?.contact_id,
-      talkId: data?.talk_id || body?.talk_id,
+    // 1) Obtener respuesta del assistant
+    const reply = await getAssistantReply(String(userMsg || ""), { leadId, contactId, traceId });
+    log.info("assistant:reply", { preview: reply.slice(0, 160) });
+
+    // 2) Si NO llegaron IDs => estamos en widget_request: responder execute_handlers (Kommo lo muestra en el chat).
+    if (!bot_id || !continue_id) {
+      const payload = {
+        data: { status: "success" },
+        execute_handlers: [{ handler: "show", params: { type: "text", value: reply.slice(0, 800) } }],
+      };
+      if (!res.writableEnded) return res.status(200).json(payload);
+      return;
+    }
+
+    // 3) Si SÍ llegaron IDs => intentar continue (modo Widget + OAuth)
+    const ok = await continueSalesbot({
+      subdomain,
+      botId: String(bot_id),
+      continueId: String(continue_id),
+      reply,
       traceId,
-    }));
-    log.info("assistant:reply", { preview: String(reply).slice(0,160) });
+    });
 
-    const leadId = Number(data?.lead_id || body?.lead_id || 0);
-    if (leadId) {
-      try { await addLeadNote(leadId, `🤖 Assistant: ${reply}`, traceId); }
-      catch (e: any) { log.warn("lead:note:fail", { err: e?.message || String(e) }); }
-    }
-
-    let delivered = false;
-    if (botId && continueId && process.env.KOMMO_ACCESS_TOKEN) {
+    // 4) Fallback: notificar return_url si vino
+    if (!ok && return_url) {
+      log.info("return_url → POST", { returnUrl: return_url });
       try {
-        await continueSalesbot({
-          subdomain,
-          accessToken: process.env.KOMMO_ACCESS_TOKEN!,
-          botId: String(botId),
-          continueId: String(continueId),
-          text: reply,
-          traceId
+        const r = await fetch(return_url, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ data: { status: "success", reply } }),
         });
-        delivered = true;
+        const t = await r.text();
+        log.info("return_url ← resp", { status: r.status, len: t.length, preview: t.slice(0, 160) });
       } catch (e: any) {
-        log.error("continue:error", { err: e?.message || String(e) });
-      }
-    } else {
-      log.warn("continue:skip", { reason: "missing botId/continueId/token" });
-    }
-
-    if (!delivered && returnUrl) {
-      try {
-        await continueViaReturnUrl(returnUrl, { status: "success", reply }, traceId);
-        delivered = true;
-      } catch (e: any) {
-        log.error("return_url:error", { err: e?.message || String(e) });
+        log.error("return_url:error", { err: String(e) });
       }
     }
 
-    if (!delivered) log.error("deliver:failed");
-    else log.info("deliver:ok");
-
-    // También devolvemos JSON por si usas {{json.reply}}
-    return res.status(200).json({ status: "success", reply, traceId });
+    if (!res.writableEnded) return res.status(200).json({ status: "success", reply, traceId });
   } catch (err: any) {
     mkLogger(traceId).error("entry:fatal", { err: err?.message || String(err) });
-    return res.status(200).json({ status: "fail", reply: "" });
+    if (!res.writableEnded) return res.status(500).json({ status: "error", traceId });
   }
 }
