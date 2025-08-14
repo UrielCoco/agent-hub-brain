@@ -79,7 +79,12 @@ async function postReturn(
     }),
   });
   const preview = await resp.text().catch(() => "");
-  log("info", "return_url ← resp", { status: resp.status, len: preview.length, preview: preview.slice(0, 160) }, traceId);
+  log(
+    "info",
+    "return_url ← resp",
+    { status: resp.status, len: preview.length, preview: preview.slice(0, 160) },
+    traceId
+  );
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
@@ -95,19 +100,29 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     log("info", "ECHO:received", { method: req.method, url: req.url, ct, len, keys }, traceId);
 
     // Detección de payload "Global" por si por error lo apuntan aquí
-    if (keys.some(k => k.startsWith("message[add][0]"))) {
-      log("warn", "ECHO:payload_looks_like_global", {
-        hint: "Este endpoint es para pruebas/chatbot. Deja el Webhook Global en /api/kommo/global.",
-      }, traceId);
+    if (keys.some((k) => k.startsWith("message[add][0]"))) {
+      log(
+        "warn",
+        "ECHO:payload_looks_like_global",
+        {
+          hint: "Este endpoint es para pruebas/chatbot. Deja el Webhook Global en /api/kommo/global.",
+        },
+        traceId
+      );
     }
 
     const text = pickMessage(body);
     const returnUrl = pickReturnUrl(body);
 
-    log("info", "ECHO:body", {
-      messagePreview: text.slice(0, 200),
-      hasReturnUrl: !!returnUrl,
-    }, traceId);
+    log(
+      "info",
+      "ECHO:body",
+      {
+        messagePreview: text.slice(0, 200),
+        hasReturnUrl: !!returnUrl,
+      },
+      traceId
+    );
 
     // Payload que Kommo entiende para continuar el bot (mostrar texto)
     const payload = {
@@ -117,9 +132,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       ],
     };
 
-    // MODO 1: Private Chatbot (Kommo nos manda return_url)
+    // MODO 1: Private Chatbot (Kommo nos manda return_url) -> fire-and-forget
     if (returnUrl) {
-      
+      // Dispara el continue y responde el ACK inmediato (<2s)
+      postReturn(returnUrl, payload, traceId).catch((e) => {
+        log("error", "return_url:error", { err: String(e) }, traceId);
+      });
       return res.status(200).json({ status: "ok", traceId });
     }
 
