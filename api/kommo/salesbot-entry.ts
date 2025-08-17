@@ -16,20 +16,24 @@ const SYSTEM_PROMPT =
   process.env.ASSISTANT_SYSTEM_PROMPT ||
   "Eres Chuy, un asistente amable. Responde breve y útil. Mantén contexto del usuario.";
 
-/** Mini GC para processed cada 6h */
+/** ---- helpers ---- */
+function isPlaceholder(s?: string) {
+  return !!s && /^\{\{.*\}\}$/.test(s.trim());
+}
+function sanitize(v: any) {
+  if (v == null) return "";
+  const s = String(v).trim();
+  if (!s) return "";
+  if (isPlaceholder(s)) return "";
+  if (s.toLowerCase?.() === "null" || s.toLowerCase?.() === "undefined") return "";
+  return s;
+}
 function gcProcessed(ttlMs = 6 * 60 * 60 * 1000) {
   const now = Date.now();
   for (const [id, ts] of processed.entries()) if (now - ts > ttlMs) processed.delete(id);
 }
-
-function isPlaceholder(s?: string) {
-  return !!s && /^\{\{.*\}\}$/.test(s);
-}
-
-/** Helper para logging “bonito” (sin volcar secretos) */
 function log(ctx: string, obj: any) {
   try {
-    // Evita imprimir Authorization, secrets, etc.
     const safe = JSON.parse(
       JSON.stringify(obj, (k, v) =>
         typeof v === "string" && /authorization|secret|api_key/i.test(k) ? "[redacted]" : v
@@ -46,7 +50,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   const providedSecret = (req.query.secret as string) || "";
   const debug = (req.query.debug as string) === "1";
 
-  // Log request básico
   log("REQ", {
     method: req.method,
     url: req.url,
@@ -70,15 +73,13 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     log("PARSE_ERR", { e: String(e) });
   }
 
-  const leadId = body.lead_id || body.leadId || "";
-  const message = body.message || body.message_text || body.text || "";
-  const messageId = body.message_id || body.messageId || "";
-  const authorTypeRaw = body.author_type || body.authorType || "";
-  const directionRaw = body.direction || body.type || "";
-  const channel = body.channel || body.source || "";
-
-  const authorType = String(authorTypeRaw || "").toLowerCase(); // external/internal/system, a veces vacío
-  const direction = String(directionRaw || "").toLowerCase();   // in/out, a veces vacío
+  // ---- sanitize TODOs ----
+  const leadId = sanitize(body.lead_id || body.leadId || "");
+  const message = sanitize(body.message || body.message_text || body.text || "");
+  const messageId = sanitize(body.message_id || body.messageId || "");
+  const authorType = sanitize(body.author_type || body.authorType || "").toLowerCase(); // external/internal/system
+  const direction = sanitize(body.direction || body.type || "").toLowerCase();           // in/out
+  const channel = sanitize(body.channel || body.source || "");
 
   log("BODY", {
     leadId,
@@ -89,17 +90,12 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     channel
   });
 
-  if (!leadId || !message || isPlaceholder(message)) {
-    log("VALIDATION", { ok: false, reason: "missing leadId/message or placeholder" });
+  if (!leadId || !message) {
+    log("VALIDATION", { ok: false, reason: "missing leadId/message" });
     return res.status(200).json({ status: "fail", reply: "Sin mensaje o lead_id" });
   }
 
-  /**
-   * REGLA ROBUSTA:
-   * - Sólo ignoramos si es CLARAMENTE no-usuario:
-   *   authorType ∈ {internal, system}  O  direction === "out"
-   * - Si vienen vacíos (muy común), asumimos usuario (mejor que silenciar).
-   */
+  // Regla robusta: sólo ignorar si CLARAMENTE no es usuario
   const clearlyNotUser =
     (authorType && (authorType === "internal" || authorType === "system")) ||
     direction === "out";
@@ -109,7 +105,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     return res.status(200).json({ status: "ignored" });
   }
 
-  // De-bounce por message_id si existe
+  // De-bounce sólo si tenemos un messageId REAL (no placeholder, no vacío)
   if (messageId) {
     if (processed.has(messageId)) {
       log("DEBOUNCE", { ignored: true, messageId });
@@ -118,10 +114,10 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     processed.set(messageId, Date.now());
     gcProcessed();
   } else {
-    log("DEBOUNCE", { note: "messageId vacío; se procesa igual" });
+    log("DEBOUNCE", { note: "sin messageId usable; se procesa igual" });
   }
 
-  // Sesión por leadId
+  // Sesión por lead
   let session = sessions.get(leadId);
   if (!session) {
     session = { history: [{ role: "system", content: SYSTEM_PROMPT }], updatedAt: Date.now() };
@@ -135,7 +131,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     session.history = [session.history[0], ...session.history.slice(-maxMsgs)];
   }
 
-  // Llamada a OpenAI
   try {
     const r = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
@@ -168,14 +163,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
     const payload: any = { status: "success", reply };
     if (debug) {
-      payload.debug = {
-        leadId,
-        authorType,
-        direction,
-        channel,
-        model: MODEL,
-        elapsed_ms: elapsed
-      };
+      payload.debug = { leadId, authorType, direction, channel, model: MODEL, elapsed_ms: elapsed };
     }
     return res.status(200).json(payload);
   } catch (e: any) {
