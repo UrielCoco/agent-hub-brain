@@ -14,23 +14,50 @@ const MAX_TURNS = 8;
 const MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
 const SYSTEM_PROMPT =
   process.env.ASSISTANT_SYSTEM_PROMPT ||
-  "Eres Chuy presetate, un asistente amable. Responde breve y útil. Mantén contexto del usuario.";
+  "Eres Chuy, un asistente amable. Responde breve y útil. Mantén contexto del usuario.";
 
-// opcional: limpiar processed cada cierto tiempo (6h)
+/** Mini GC para processed cada 6h */
 function gcProcessed(ttlMs = 6 * 60 * 60 * 1000) {
   const now = Date.now();
-  for (const [id, ts] of processed.entries()) {
-    if (now - ts > ttlMs) processed.delete(id);
-  }
+  for (const [id, ts] of processed.entries()) if (now - ts > ttlMs) processed.delete(id);
 }
 
 function isPlaceholder(s?: string) {
   return !!s && /^\{\{.*\}\}$/.test(s);
 }
 
+/** Helper para logging “bonito” (sin volcar secretos) */
+function log(ctx: string, obj: any) {
+  try {
+    // Evita imprimir Authorization, secrets, etc.
+    const safe = JSON.parse(
+      JSON.stringify(obj, (k, v) =>
+        typeof v === "string" && /authorization|secret|api_key/i.test(k) ? "[redacted]" : v
+      )
+    );
+    console.log(`[salesbot-entry] ${ctx}:`, safe);
+  } catch {
+    console.log(`[salesbot-entry] ${ctx}: (no-serializable)`);
+  }
+}
+
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
+  const t0 = Date.now();
   const providedSecret = (req.query.secret as string) || "";
+  const debug = (req.query.debug as string) === "1";
+
+  // Log request básico
+  log("REQ", {
+    method: req.method,
+    url: req.url,
+    headers: {
+      "content-type": req.headers["content-type"],
+      "user-agent": req.headers["user-agent"]
+    }
+  });
+
   if (!process.env.WEBHOOK_SECRET || providedSecret !== process.env.WEBHOOK_SECRET) {
+    log("AUTH", { ok: false, reason: "Forbidden/Secret mismatch" });
     return res.status(200).json({ status: "fail", reply: "Forbidden" });
   }
 
@@ -39,34 +66,62 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   try {
     if (ct.includes("application/json")) body = req.body || {};
     else if (ct.includes("application/x-www-form-urlencoded")) body = req.body || {};
-  } catch {}
+  } catch (e) {
+    log("PARSE_ERR", { e: String(e) });
+  }
 
   const leadId = body.lead_id || body.leadId || "";
   const message = body.message || body.message_text || body.text || "";
   const messageId = body.message_id || body.messageId || "";
-  const authorType = (body.author_type || "").toLowerCase(); // "external" (usuario) / "system" / "internal"
-  const direction = (body.direction || "").toLowerCase();     // "in" / "out" (si viene)
-  const channel = body.channel || "";                          // whatsapp, instagram, etc.
+  const authorTypeRaw = body.author_type || body.authorType || "";
+  const directionRaw = body.direction || body.type || "";
+  const channel = body.channel || body.source || "";
+
+  const authorType = String(authorTypeRaw || "").toLowerCase(); // external/internal/system, a veces vacío
+  const direction = String(directionRaw || "").toLowerCase();   // in/out, a veces vacío
+
+  log("BODY", {
+    leadId,
+    message_preview: typeof message === "string" ? message.slice(0, 200) : "(non-string)",
+    messageId,
+    authorType,
+    direction,
+    channel
+  });
 
   if (!leadId || !message || isPlaceholder(message)) {
+    log("VALIDATION", { ok: false, reason: "missing leadId/message or placeholder" });
     return res.status(200).json({ status: "fail", reply: "Sin mensaje o lead_id" });
   }
 
-  // 1) Solo procesar mensajes de USUARIO (evita loop con tus propias respuestas)
-  if (authorType && authorType !== "external") {
+  /**
+   * REGLA ROBUSTA:
+   * - Sólo ignoramos si es CLARAMENTE no-usuario:
+   *   authorType ∈ {internal, system}  O  direction === "out"
+   * - Si vienen vacíos (muy común), asumimos usuario (mejor que silenciar).
+   */
+  const clearlyNotUser =
+    (authorType && (authorType === "internal" || authorType === "system")) ||
+    direction === "out";
+
+  if (clearlyNotUser) {
+    log("FILTER", { ignored: true, reason: "not external/inbound" });
     return res.status(200).json({ status: "ignored" });
   }
 
-  // 2) De-bounce por message_id (si viene vacío, no bloquea)
+  // De-bounce por message_id si existe
   if (messageId) {
     if (processed.has(messageId)) {
+      log("DEBOUNCE", { ignored: true, messageId });
       return res.status(200).json({ status: "ignored" });
     }
     processed.set(messageId, Date.now());
     gcProcessed();
+  } else {
+    log("DEBOUNCE", { note: "messageId vacío; se procesa igual" });
   }
 
-  // 3) Preparar sesión
+  // Sesión por leadId
   let session = sessions.get(leadId);
   if (!session) {
     session = { history: [{ role: "system", content: SYSTEM_PROMPT }], updatedAt: Date.now() };
@@ -80,6 +135,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     session.history = [session.history[0], ...session.history.slice(-maxMsgs)];
   }
 
+  // Llamada a OpenAI
   try {
     const r = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
@@ -93,7 +149,13 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         messages: session.history
       })
     });
-    if (!r.ok) throw new Error(`OpenAI ${r.status}`);
+
+    if (!r.ok) {
+      const text = await r.text();
+      log("OPENAI_BAD", { status: r.status, body: text.slice(0, 400) });
+      throw new Error(`OpenAI ${r.status}`);
+    }
+
     const data = await r.json();
     const reply = data?.choices?.[0]?.message?.content?.trim() || "";
 
@@ -101,10 +163,24 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     session.updatedAt = Date.now();
     sessions.set(leadId, session);
 
-    // Nota: aquí SOLO devolvemos la respuesta; el Salesbot la muestra en paso 4 y luego espera.
-    return res.status(200).json({ status: "success", reply, meta: { channel, direction } });
-  } catch (e) {
-    console.error("OpenAI error:", e);
+    const elapsed = Date.now() - t0;
+    log("OK", { elapsed_ms: elapsed, reply_preview: reply.slice(0, 200) });
+
+    const payload: any = { status: "success", reply };
+    if (debug) {
+      payload.debug = {
+        leadId,
+        authorType,
+        direction,
+        channel,
+        model: MODEL,
+        elapsed_ms: elapsed
+      };
+    }
+    return res.status(200).json(payload);
+  } catch (e: any) {
+    const elapsed = Date.now() - t0;
+    log("OPENAI_ERR", { error: String(e), elapsed_ms: elapsed });
     return res.status(200).json({ status: "fail" });
   }
 }
