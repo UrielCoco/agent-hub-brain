@@ -1,74 +1,77 @@
-import type { VercelRequest, VercelResponse } from '@vercel/node';
-import crypto from 'crypto';
+import type { NextApiRequest, NextApiResponse } from "next";
 
-function timingSafeEq(a: string, b: string) {
-  const A = Buffer.from(a); const B = Buffer.from(b);
-  if (A.length !== B.length) return false;
-  return crypto.timingSafeEqual(A, B);
+const SESSIONS_KEY = "kommo_sessions";
+const g: any = global as any;
+g[SESSIONS_KEY] ||= new Map<string, { history: any[]; updatedAt: number }>();
+const sessions: Map<string, { history: any[]; updatedAt: number }> = g[SESSIONS_KEY];
+
+const MAX_TURNS = 8;
+const MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
+const SYSTEM_PROMPT =
+  process.env.ASSISTANT_SYSTEM_PROMPT ||
+  "Eres Chuy, un asistente amable. Responde breve y útil. Mantén contexto del usuario.";
+
+function isPlaceholder(s?: string) {
+  return !!s && /^\{\{.*\}\}$/.test(s);
 }
-function ok(res: VercelResponse, reply: string) {
-  return res.status(200).json({
-    status: 'success',
-    reply,
-    execute_handlers: [{ handler: 'show', params: { type: 'text', value: reply } }]
-  });
-}
 
-export default async function handler(req: VercelRequest, res: VercelResponse) {
-  if (req.method !== 'POST') return res.status(405).json({ status: 'fail', error: 'method_not_allowed' });
-
-  console.log('📩 KOMMO HIT', {
-    method: req.method, url: req.url,
-    ct: req.headers['content-type'], ua: req.headers['user-agent'],
-    env: process.env.VERCEL_ENV || 'unknown'
-  });
-
-  // Secret en query (?secret=...) vs ENV WEBHOOK_SECRET
-  const host = req.headers.host || 'localhost';
-  const full = new URL(req.url || '/', `https://${host}`);
-  const gotSecret = (full.searchParams.get('secret') || '').trim();
-  const envSecret = (process.env.WEBHOOK_SECRET || '').trim();
-  console.log('🔐 Secret debug', {
-    got_len: gotSecret.length, env_len: envSecret.length,
-    got_edge: gotSecret ? `${gotSecret.slice(0,4)}…${gotSecret.slice(-4)}` : '(empty)',
-    env_edge: envSecret ? `${envSecret.slice(0,4)}…${envSecret.slice(-4)}` : '(empty)'
-  });
-  if (!envSecret || !gotSecret || !timingSafeEq(gotSecret, envSecret)) {
-    console.warn('❌ Forbidden: secret mismatch');
-    return res.status(403).json({ status: 'fail', error: 'forbidden' });
+export default async function handler(req: NextApiRequest, res: NextApiResponse) {
+  const providedSecret = (req.query.secret as string) || "";
+  if (!process.env.WEBHOOK_SECRET || providedSecret !== process.env.WEBHOOK_SECRET) {
+    return res.status(200).json({ status: "fail", reply: "Forbidden" });
   }
 
-  // Parseo JSON / x-www-form-urlencoded
-  const ct = (req.headers['content-type'] || '').toLowerCase();
-  let body: any = req.body ?? {};
-  if (typeof body === 'string') {
-    try {
-      if (ct.includes('application/json')) body = JSON.parse(body);
-      else if (ct.includes('application/x-www-form-urlencoded'))
-        body = Object.fromEntries(new URLSearchParams(body));
-    } catch (e) { console.error('💥 Parse error (string body)', e); }
+  const ct = req.headers["content-type"] || "";
+  let body: any = {};
+  try {
+    if (ct.includes("application/json")) body = req.body || {};
+    else if (ct.includes("application/x-www-form-urlencoded")) body = req.body || {};
+  } catch {}
+
+  const leadId = body.lead_id || body.leadId || "";
+  let message = body.message || body.message_text || body.text || "";
+
+  if (!leadId || !message || isPlaceholder(message)) {
+    return res.status(200).json({ status: "fail", reply: "Sin mensaje o lead_id" });
   }
-  if (!body || Object.keys(body).length === 0) {
-    const raw = await new Promise<string>((resolve) => {
-      let data = ''; req.on('data', (c) => (data += c));
-      req.on('end', () => resolve(data)); req.on('error', () => resolve(''));
+
+  let session = sessions.get(leadId);
+  if (!session) {
+    session = { history: [{ role: "system", content: SYSTEM_PROMPT }], updatedAt: Date.now() };
+  }
+
+  session.history.push({ role: "user", content: message });
+
+  const maxMsgs = MAX_TURNS * 2;
+  const withoutSystem = session.history.filter((m) => m.role !== "system");
+  if (withoutSystem.length > maxMsgs) {
+    session.history = [session.history[0], ...session.history.slice(-maxMsgs)];
+  }
+
+  try {
+    const r = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        model: MODEL,
+        temperature: 0.6,
+        messages: session.history
+      })
     });
-    try {
-      if (raw) {
-        if (ct.includes('application/json')) body = JSON.parse(raw);
-        else if (ct.includes('application/x-www-form-urlencoded'))
-          body = Object.fromEntries(new URLSearchParams(raw));
-      }
-    } catch (e) { console.error('💥 Parse error (raw body)', e); }
+    if (!r.ok) throw new Error(`OpenAI ${r.status}`);
+    const data = await r.json();
+    const reply = data?.choices?.[0]?.message?.content?.trim() || "";
+
+    session.history.push({ role: "assistant", content: reply });
+    session.updatedAt = Date.now();
+    sessions.set(leadId, session);
+
+    return res.status(200).json({ status: "success", reply });
+  } catch (e) {
+    console.error("OpenAI error:", e);
+    return res.status(200).json({ status: "fail" });
   }
-
-  const message = body?.message ?? body?.message_text ?? '';
-  const leadId  = body?.lead_id ?? body?.leadId ?? '';
-  console.log('🧾 Parsed payload', { message, leadId, keys: Object.keys(body || {}) });
-
-  // TODO: Aquí conecta con tu Assistant real (usa tu lib interna o SDK)
-  const reply = message ? `Echo: ${message}` : 'Hola 👋 ¿en qué te ayudo?';
-
-  console.log('✅ Responding success');
-  return ok(res, reply);
 }
