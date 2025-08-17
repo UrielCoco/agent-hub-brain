@@ -24,7 +24,7 @@ const SYSTEM_PROMPT =
   process.env.ASSISTANT_SYSTEM_PROMPT ||
   "Eres Chuy, un asistente amable. Responde breve y útil. Mantén contexto del usuario.";
 
-const SIG_COOLDOWN_MS = 25_000;   // ventana para no reprocesar el MISMO texto
+const SIG_COOLDOWN_MS = 8000;   // ventana para no reprocesar el MISMO texto
 const SEEN_TTL_MS      = 2 * 60 * 60 * 1000; // 2h para limpiar firmas vistas
 
 // ---- Utils ----
@@ -131,6 +131,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   // 3) Firma por contenido para evitar “hola” repetido sin message_id
   const msgNorm = normalize(message);
   const sig = `${leadId}#${msgNorm}`;
+  log("MSG_SIG", { leadId, msgNorm, sig });
   const now = Date.now();
   gcMaps();
 
@@ -142,10 +143,10 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     return res.status(200).json({ status: "ignored" });
   }
   const lastSeenAt = seenSig.get(sig) || 0;
-  if (now - lastSeenAt < SIG_COOLDOWN_MS) {
-    log("SIG_DEDUP", { ignored: true, reason: "texto repetido en ventana", cooldown_ms: SIG_COOLDOWN_MS });
-    return res.status(200).json({ status: "ignored" });
-  }
+  // if (now - lastSeenAt < SIG_COOLDOWN_MS) {
+  //  log("SIG_DEDUP", { ignored: true, reason: "texto repetido en ventana", cooldown_ms: SIG_COOLDOWN_MS });
+  //  return res.status(200).json({ status: "ignored" });
+  //}
   // marcar firma y actualizar estado de usuario
   seenSig.set(sig, now);
   session.lastUserText = msgNorm;
