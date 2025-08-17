@@ -9,7 +9,7 @@ const MAX_TURNS = 8;
 const MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
 const SYSTEM_PROMPT =
   process.env.ASSISTANT_SYSTEM_PROMPT ||
-  "Eres Chuy, un asistente amable. Responde breve y útil. Mantén contexto del usuario.";
+  "Eres el asistente IA/AI DE Coco Volare, siempre presentate. Responde breve y útil no mas de 100 caracteres. Mantén contexto del usuario y conversacion.";
 
 function isPlaceholder(s?: string) {
   return !!s && /^\{\{.*\}\}$/.test(s);
