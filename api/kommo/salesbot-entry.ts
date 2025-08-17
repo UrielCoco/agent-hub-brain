@@ -1,15 +1,20 @@
 import type { NextApiRequest, NextApiResponse } from "next";
 
-const SESSIONS_KEY = "kommo_sessions";
+const SESSIONS_KEY = "kommo_sessions_v1";
 const g: any = global as any;
-g[SESSIONS_KEY] ||= new Map<string, { history: any[]; updatedAt: number }>();
-const sessions: Map<string, { history: any[]; updatedAt: number }> = g[SESSIONS_KEY];
+g[SESSIONS_KEY] ||= new Map<
+  string,
+  { history: any[]; lastMsg?: string; lastAt?: number }
+>();
+const sessions: Map<string, { history: any[]; lastMsg?: string; lastAt?: number }> =
+  g[SESSIONS_KEY];
 
-const MAX_TURNS = 8;
 const MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
 const SYSTEM_PROMPT =
   process.env.ASSISTANT_SYSTEM_PROMPT ||
-  "Eres el asistente IA/AI DE Coco Volare, siempre presentate. Responde breve y útil no mas de 100 caracteres y siiempre en idioma de usuario. Mantén contexto del usuario y conversacion";
+  "Eres un asistente llamado Chuy. Respondes en español, breve y útil, manteniendo el contexto.";
+const MAX_TURNS = 8;
+const REBOUND_MS = 1500;
 
 function isPlaceholder(s?: string) {
   return !!s && /^\{\{.*\}\}$/.test(s);
@@ -18,7 +23,7 @@ function isPlaceholder(s?: string) {
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   const providedSecret = (req.query.secret as string) || "";
   if (!process.env.WEBHOOK_SECRET || providedSecret !== process.env.WEBHOOK_SECRET) {
-    return res.status(200).json({ status: "fail", reply: "Forbidden" });
+    return res.status(200).json({ status: "success", reply: "⚠️ Acceso restringido." });
   }
 
   const ct = (req.headers["content-type"] as string) || "";
@@ -29,25 +34,33 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   } catch {}
 
   const leadId = body.lead_id || body.leadId || "";
-  let message = body.message || body.message_text || body.text || "";
+  const textIn = body.message || body.message_text || body.text || "";
 
-  if (!leadId || !message || isPlaceholder(message)) {
-    return res.status(200).json({ status: "fail", reply: "Sin mensaje o lead_id" });
+  if (!leadId || !textIn || isPlaceholder(textIn)) {
+    return res.status(200).json({ status: "success", reply: "¿Podrías repetir? No recibí tu mensaje." });
   }
 
-  let session = sessions.get(leadId);
-  if (!session) {
-    session = { history: [{ role: "system", content: SYSTEM_PROMPT }], updatedAt: Date.now() };
+  let s = sessions.get(leadId);
+  if (!s) {
+    s = { history: [{ role: "system", content: SYSTEM_PROMPT }] };
   }
 
-  session.history.push({ role: "user", content: message });
+  const now = Date.now();
+  if (s.lastMsg === textIn && s.lastAt && now - s.lastAt < REBOUND_MS) {
+    return res.status(200).json({ status: "success", reply: "" });
+  }
+  s.lastMsg = textIn;
+  s.lastAt = now;
 
-  const maxMsgs = MAX_TURNS * 2;
-  const noSys = session.history.filter(m => m.role !== "system");
-  if (noSys.length > maxMsgs) {
-    session.history = [session.history[0], ...session.history.slice(-maxMsgs)];
+  s.history.push({ role: "user", content: textIn });
+
+  const noSys = s.history.filter(m => m.role !== "system");
+  const max = MAX_TURNS * 2;
+  if (noSys.length > max) {
+    s.history = [s.history[0], ...s.history.slice(-max)];
   }
 
+  let reply = "";
   try {
     const r = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
@@ -58,21 +71,19 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       body: JSON.stringify({
         model: MODEL,
         temperature: 0.6,
-        messages: session.history
+        messages: s.history
       })
     });
     if (!r.ok) throw new Error(`OpenAI ${r.status}`);
     const data = await r.json();
-    let reply = data?.choices?.[0]?.message?.content?.trim() || "";
-    if (!reply) reply = "Estoy aquí. ¿Podrías reformular o dar más detalles?";
-
-    session.history.push({ role: "assistant", content: reply });
-    session.updatedAt = Date.now();
-    sessions.set(leadId, session);
-
-    return res.status(200).json({ status: "success", reply });
+    reply = data?.choices?.[0]?.message?.content?.trim() || "";
   } catch (e) {
-    console.error("OpenAI error", e);
-    return res.status(200).json({ status: "fail" });
+    console.error("OpenAI error:", e);
+    reply = "Hubo un problema momentáneo con la IA. Intenta otra vez en unos segundos.";
   }
+
+  if (reply) s.history.push({ role: "assistant", content: reply });
+  sessions.set(leadId, s);
+
+  return res.status(200).json({ status: "success", reply });
 }
