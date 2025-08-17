@@ -43,7 +43,10 @@ export async function continueSalesbot(args: ContinueArgs) {
   const url = `${kommoBase(subdomain)}/api/v4/salesbot/${botId}/continue/${continueId}`;
   const body = {
     data: { status: "success", reply: text, ...extraData },
-    execute_handlers: [{ handler: "show", params: { text } }],
+    execute_handlers: [
+      { handler: "show", params: { type: "text", value: text } },
+      { handler: "goto", params: { type: "answer", step: 0 } }
+    ],
   };
 
   log.info("continueSalesbot → POST", { url, textPreview: String(text).slice(0,80) });
@@ -61,20 +64,15 @@ export async function continueSalesbot(args: ContinueArgs) {
 }
 
 /** Fallback: continuar con return_url que envía Kommo en widget_request */
-export async function continueViaReturnUrl(returnUrl: string, dataObj: any, traceId?: string) {
-  const log = mkLogger(traceId);
-  log.info("return_url → POST", { returnUrl, dataPreview: JSON.stringify(dataObj).slice(0,120) });
-
-  const r = await fetch(returnUrl, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ data: dataObj }),
-  });
-
-  const txt = await r.text().catch(() => "");
-  log.info("return_url ← resp", { status: r.status, len: txt.length, preview: txt.slice(0,200) });
-
-  if (!r.ok) throw new Error(`return_url failed ${r.status}: ${txt}`);
+export async function continueViaReturnUrl(returnUrl: string, text: string, extraData: any = {}, traceId?: string) {
+  const body = {
+    data: { status: "success", reply: text, ...extraData },
+    execute_handlers: [
+      { handler: "show", params: { type: "text", value: text } },
+      { handler: "goto", params: { type: "answer", step: 0 } }
+    ]
+  };
+  await fetch(returnUrl, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
 }
 
 /** Nota en Lead (útil p/ auditoría) */

@@ -61,6 +61,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     let delivered = false;
     if (botId && continueId && process.env.KOMMO_ACCESS_TOKEN) {
       try {
+        
         await continueSalesbot({
           subdomain, accessToken: process.env.KOMMO_ACCESS_TOKEN!,
           botId: String(botId), continueId: String(continueId),
@@ -77,7 +78,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     // Intento 2: return_url
     if (!delivered && returnUrl) {
       try {
-        await continueViaReturnUrl(returnUrl, { status: "success", reply }, traceId);
+        await continueViaReturnUrl(returnUrl, reply, {}, traceId);
         delivered = true;
       } catch (e: any) {
         log.error("return_url:error", { err: e?.message || String(e) });
