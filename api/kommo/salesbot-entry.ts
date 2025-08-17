@@ -1,15 +1,28 @@
 import type { NextApiRequest, NextApiResponse } from "next";
 
 const SESSIONS_KEY = "kommo_sessions";
+const PROCESSED_KEY = "kommo_processed";
 const g: any = global as any;
+
 g[SESSIONS_KEY] ||= new Map<string, { history: any[]; updatedAt: number }>();
+g[PROCESSED_KEY] ||= new Map<string, number>(); // message_id -> timestamp
+
 const sessions: Map<string, { history: any[]; updatedAt: number }> = g[SESSIONS_KEY];
+const processed: Map<string, number> = g[PROCESSED_KEY];
 
 const MAX_TURNS = 8;
 const MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
 const SYSTEM_PROMPT =
   process.env.ASSISTANT_SYSTEM_PROMPT ||
-  "Eres Chuy, un asistente amable. Responde breve y útil. Mantén contexto del usuario.";
+  "Eres Chuy presetate, un asistente amable. Responde breve y útil. Mantén contexto del usuario.";
+
+// opcional: limpiar processed cada cierto tiempo (6h)
+function gcProcessed(ttlMs = 6 * 60 * 60 * 1000) {
+  const now = Date.now();
+  for (const [id, ts] of processed.entries()) {
+    if (now - ts > ttlMs) processed.delete(id);
+  }
+}
 
 function isPlaceholder(s?: string) {
   return !!s && /^\{\{.*\}\}$/.test(s);
@@ -29,19 +42,38 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   } catch {}
 
   const leadId = body.lead_id || body.leadId || "";
-  let message = body.message || body.message_text || body.text || "";
+  const message = body.message || body.message_text || body.text || "";
+  const messageId = body.message_id || body.messageId || "";
+  const authorType = (body.author_type || "").toLowerCase(); // "external" (usuario) / "system" / "internal"
+  const direction = (body.direction || "").toLowerCase();     // "in" / "out" (si viene)
+  const channel = body.channel || "";                          // whatsapp, instagram, etc.
 
   if (!leadId || !message || isPlaceholder(message)) {
     return res.status(200).json({ status: "fail", reply: "Sin mensaje o lead_id" });
   }
 
+  // 1) Solo procesar mensajes de USUARIO (evita loop con tus propias respuestas)
+  if (authorType && authorType !== "external") {
+    return res.status(200).json({ status: "ignored" });
+  }
+
+  // 2) De-bounce por message_id (si viene vacío, no bloquea)
+  if (messageId) {
+    if (processed.has(messageId)) {
+      return res.status(200).json({ status: "ignored" });
+    }
+    processed.set(messageId, Date.now());
+    gcProcessed();
+  }
+
+  // 3) Preparar sesión
   let session = sessions.get(leadId);
   if (!session) {
     session = { history: [{ role: "system", content: SYSTEM_PROMPT }], updatedAt: Date.now() };
   }
-
   session.history.push({ role: "user", content: message });
 
+  // Limitar contexto
   const maxMsgs = MAX_TURNS * 2;
   const withoutSystem = session.history.filter((m) => m.role !== "system");
   if (withoutSystem.length > maxMsgs) {
@@ -69,7 +101,8 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     session.updatedAt = Date.now();
     sessions.set(leadId, session);
 
-    return res.status(200).json({ status: "success", reply });
+    // Nota: aquí SOLO devolvemos la respuesta; el Salesbot la muestra en paso 4 y luego espera.
+    return res.status(200).json({ status: "success", reply, meta: { channel, direction } });
   } catch (e) {
     console.error("OpenAI error:", e);
     return res.status(200).json({ status: "fail" });
