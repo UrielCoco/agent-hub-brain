@@ -154,7 +154,6 @@ async function updateContact(ctx: string, id: number, input: { name?: string; em
     ...(input.name ? { name: input.name } : {}),
   }];
 
-  // CF en PATCH deben ir completos para los campos a modificar
   const cf = buildCF({ email: input.email, phone: input.phone });
   if (cf.length) payload[0].custom_fields_values = cf;
 
@@ -173,12 +172,32 @@ type CreateLeadInput = {
 };
 async function handleCreateLead(ctx: string, body: any) {
   const input: CreateLeadInput = body || {};
+
+  // Sanitiza IDs: solo incluye si son > 0 (Kommo rechaza 0)
+  const pipelineId =
+    Number.isFinite(input.pipeline_id) && Number(input.pipeline_id) > 0
+      ? Number(input.pipeline_id)
+      : undefined;
+  const statusId =
+    Number.isFinite(input.status_id) && Number(input.status_id) > 0
+      ? Number(input.status_id)
+      : undefined;
+
+  if (input.pipeline_id && !pipelineId) {
+    log(ctx, 'create-lead_sanitize', { dropped: 'pipeline_id', value: input.pipeline_id });
+  }
+  if (input.status_id && !statusId) {
+    log(ctx, 'create-lead_sanitize', { dropped: 'status_id', value: input.status_id });
+  }
+
   const payload = [{
     name: input.name || 'Nuevo lead',
     price: typeof input.price === 'number' ? input.price : undefined,
-    pipeline_id: input.pipeline_id,
-    status_id: input.status_id,
-    tags: Array.isArray(input.tags) ? input.tags.map((t) => ({ name: String(t) })) : undefined,
+    pipeline_id: pipelineId,
+    status_id: statusId,
+    tags: Array.isArray(input.tags) && input.tags.length
+      ? input.tags.map((t) => ({ name: String(t) }))
+      : undefined,
     custom_fields_values: input.custom_fields
       ? Object.entries(input.custom_fields).map(([code, value]) => ({ field_code: code, values: [{ value }] }))
       : undefined,
@@ -203,9 +222,24 @@ async function handleUpdateLead(ctx: string, body: any) {
 
   const patch: any = {};
   if (typeof body?.price === 'number') patch.price = body.price;
-  if (typeof body?.pipeline_id === 'number') patch.pipeline_id = body.pipeline_id;
-  if (typeof body?.status_id === 'number') patch.status_id = body.status_id;
-  if (Array.isArray(body?.tags)) patch.tags = body.tags.map((t: any) => ({ name: String(t) }));
+
+  if (Number.isFinite(body?.pipeline_id) && Number(body.pipeline_id) > 0) {
+    patch.pipeline_id = Number(body.pipeline_id);
+  } else if (body?.pipeline_id !== undefined) {
+    log(ctx, 'update-lead_sanitize', { dropped: 'pipeline_id', value: body.pipeline_id });
+  }
+
+  if (Number.isFinite(body?.status_id) && Number(body.status_id) > 0) {
+    patch.status_id = Number(body.status_id);
+  } else if (body?.status_id !== undefined) {
+    log(ctx, 'update-lead_sanitize', { dropped: 'status_id', value: body.status_id });
+  }
+
+  if (Array.isArray(body?.tags)) {
+    const tags = body.tags.map((t: any) => ({ name: String(t) })).filter((t: any) => t.name.trim().length);
+    if (tags.length) patch.tags = tags;
+  }
+
   if (body?.custom_fields) {
     patch.custom_fields_values = Object.entries(body.custom_fields).map(([code, value]) => ({
       field_code: code, values: [{ value }]
@@ -228,17 +262,14 @@ async function handleAttachContact(ctx: string, body: any) {
 
   if (!name && !email && !phone) throw new Error('provide name/email/phone');
 
-  // 1) obten lead y posible contacto vinculado
   const lead = await getLead(ctx, leadId);
   let contactId: number | null = lead?._embedded?.contacts?.[0]?.id ? Number(lead._embedded.contacts[0].id) : null;
 
-  // 2) si no hay, intenta encontrar por email/phone
   if (!contactId && (email || phone)) {
     const found = await findContactByQuery(ctx, email || phone!);
     if (found?.id) contactId = Number(found.id);
   }
 
-  // 3) crear o actualizar contacto
   if (!contactId) {
     const c = await createContact(ctx, { name, email, phone });
     contactId = Number(c.id);
@@ -246,10 +277,8 @@ async function handleAttachContact(ctx: string, body: any) {
     await updateContact(ctx, contactId, { name, email, phone });
   }
 
-  // 4) vincular al lead (aunque ya exista el vínculo)
   await updateLead(ctx, leadId, { _embedded: { contacts: [{ id: contactId }] } });
 
-  // 5) opcional: nota
   if (body?.notes) await addLeadNote(ctx, leadId, String(body.notes));
 
   log(ctx, 'attach-contact_done', { leadId, contactId });
