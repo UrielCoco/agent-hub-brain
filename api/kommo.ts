@@ -1,395 +1,210 @@
-// api/kommo.ts
-import type { VercelRequest, VercelResponse } from '@vercel/node';
+import type { NextApiRequest, NextApiResponse } from 'next';
 
-/**
- * ====== ENV ======
- * - Usa token de larga duración (sin refresh).
- * - Configura UNO:
- *   - KOMMO_BASE_URL = https://<sub>.kommo.com  (o .amocrm.com si aplica)
- *   - KOMMO_SUBDOMAIN = <sub>
- * - Requerido:
- *   - KOMMO_ACCESS_TOKEN
- *   - WEBHOOK_SECRET  (debe coincidir con HUB_BRIDGE_SECRET en chat-ai)
- */
-const KOMMO_BASE_URL = (process.env.KOMMO_BASE_URL || '').trim();
-const KOMMO_SUBDOMAIN = (process.env.KOMMO_SUBDOMAIN || '').trim();
-const KOMMO_ACCESS_TOKEN = (process.env.KOMMO_ACCESS_TOKEN || '').trim();
-const BRIDGE_SECRET = (process.env.WEBHOOK_SECRET || '').trim();
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || process.env.HUB_BRIDGE_SECRET || '';
+const KOMMO_BASE_URL =
+  process.env.KOMMO_BASE_URL ||
+  (process.env.KOMMO_SUBDOMAIN ? `https://${process.env.KOMMO_SUBDOMAIN}.kommo.com` : '');
+const KOMMO_ACCESS_TOKEN = process.env.KOMMO_ACCESS_TOKEN || '';
 
-/** ====== Utils & logging ====== */
-function nowISO() { return new Date().toISOString(); }
-function rid() { return Math.random().toString(36).slice(2, 10); }
-function preview(x: any, max = 300) {
-  const s = typeof x === 'string' ? x : JSON.stringify(x);
-  return s.length > max ? s.slice(0, max) + `… (${s.length} chars)` : s;
-}
-function log(ctx: string, msg: string, data?: any) {
-  const clean = data ? JSON.parse(JSON.stringify(data)) : undefined;
-  if (clean?.headers?.Authorization) clean.headers.Authorization = '<redacted>';
-  console.log(JSON.stringify({ ts: nowISO(), ctx, msg, data: clean }));
-}
+type OkRes = { ok: true; data?: any };
+type ErrRes = { ok: false; error: string; detail?: any };
 
-/** ====== Base URL normalizada ====== */
-function kommoBase(): string {
-  let raw =
-    (KOMMO_BASE_URL && KOMMO_BASE_URL.trim()) ||
-    (KOMMO_SUBDOMAIN ? `${KOMMO_SUBDOMAIN}.kommo.com` : '');
-  if (!raw) throw new Error('KOMMO_BASE_URL or KOMMO_SUBDOMAIN missing');
-  if (!/^https?:\/\//i.test(raw)) raw = `https://${raw}`;
-  return raw.replace(/\/+$/, '');
-}
-function apiV4(p: string) { return `${kommoBase()}/api/v4/${p.replace(/^\/+/, '')}`; }
-
-/** ====== Headers ====== */
-function authHeaders() {
-  if (!KOMMO_ACCESS_TOKEN) throw new Error('KOMMO_ACCESS_TOKEN missing');
-  return { Authorization: `Bearer ${KOMMO_ACCESS_TOKEN}`, 'Content-Type': 'application/json' };
-}
-
-/** ====== Fetch con logs + backoff (sin refresh) ====== */
-async function sleep(ms: number) { return new Promise(r => setTimeout(r, ms)); }
-
-async function kommoFetch(
-  ctx: string,
-  path: string,
-  init: RequestInit = {},
-  attempt = 0
-): Promise<Response> {
-  const url = apiV4(path);
-  const headers = { ...authHeaders(), ...(init.headers || {}) } as Record<string,string>;
-  const bodyPreview = init.body ? preview(init.body, 400) : undefined;
-  log(ctx, 'kommo_request', { method: init.method || 'GET', url, attempt, bodyPreview });
-
-  const res = await fetch(url, { ...init, headers });
-
-  // Leer respuesta cruda para log y reconstrucción segura
-  const rawText = await res.text().catch(() => '');
-  const isJsonLike = rawText.startsWith('{') || rawText.startsWith('[');
-  const parsed = isJsonLike ? (() => { try { return JSON.parse(rawText); } catch { return rawText; } })() : rawText;
-
-  if (res.ok) {
-    // 204 NO CONTENT: NO devolver body (si pasas body en 204, Response() lanza error)
-    if (res.status === 204) {
-      log(ctx, 'kommo_response_ok', { status: res.status, url, bodyPreview: '<no content>' });
-      return new Response(null, { status: 204 });
-    }
-
-    log(ctx, 'kommo_response_ok', { status: res.status, url, bodyPreview: preview(parsed, 400) });
-
-    const outBody = isJsonLike ? JSON.stringify(parsed) : (typeof parsed === 'string' ? parsed : String(parsed));
-    return new Response(outBody, {
-      status: res.status,
-      headers: { 'content-type': res.headers.get('content-type') || (isJsonLike ? 'application/json' : 'text/plain') }
-    });
-  }
-
-  const retriable = res.status === 429 || res.status >= 500;
-  log(ctx, 'kommo_response_error', { status: res.status, url, attempt, retriable, bodyPreview: preview(parsed, 600) });
-
-  if (retriable && attempt < 3) {
-    const delay = 300 * (attempt + 1);
-    await sleep(delay);
-    return kommoFetch(ctx, path, init, attempt + 1);
-  }
-
-  throw new Error(`${path} ${res.status}: ${typeof parsed === 'string' ? parsed : JSON.stringify(parsed)}`);
-}
-
-/** ====== Helpers Kommo ====== */
-async function addLeadNote(ctx: string, leadId: number, text: string) {
-  const payload = [{ entity_id: leadId, note_type: 'common', params: { text } }];
-  const res = await kommoFetch(`${ctx}:add-note`, 'leads/notes', { method: 'POST', body: JSON.stringify(payload) });
-  return res.json().catch(() => ({}));
-}
-
-async function getLead(ctx: string, id: number) {
-  const res = await kommoFetch(`${ctx}:get-lead`, `leads/${id}?with=contacts`, { method: 'GET' });
-  const d = await res.json().catch(() => ({}));
-  log(ctx, 'get-lead_result', { id, contacts: d?._embedded?.contacts?.length || 0 });
-  return d;
-}
-
-async function updateLead(ctx: string, id: number, patch: any) {
-  const payload = [{ id, ...patch }];
-  const res = await kommoFetch(`${ctx}:update-lead`, 'leads', { method: 'PATCH', body: JSON.stringify(payload) });
-  const d = await res.json().catch(() => ({}));
-  log(ctx, 'update-lead_ok', { id, patchPreview: preview(patch) });
-  return d;
-}
-
-async function findContactByQuery(ctx: string, query: string) {
-  const res = await kommoFetch(`${ctx}:find-contact`,
-    `contacts?query=${encodeURIComponent(query)}&with=leads&limit=1`,
-    { method: 'GET' }
-  );
-
-  // 204 → no hay resultados
-  if (res.status === 204) {
-    log(ctx, 'find-contact_result', { query, found_id: null, leads_count: 0 });
-    return null;
-  }
-
-  const d = await res.json().catch(() => ({}));
-  const contact = d?._embedded?.contacts?.[0] || null;
-  log(ctx, 'find-contact_result', { query, found_id: contact?.id || null, leads_count: contact?._embedded?.leads?.length || 0 });
-  return contact;
-}
-
-async function getContactById(ctx: string, id: number) {
-  const res = await kommoFetch(`${ctx}:get-contact`, `contacts/${id}?with=leads`, { method: 'GET' });
-  const d = await res.json().catch(() => ({}));
-  log(ctx, 'get-contact_result', { id, leads_count: d?._embedded?.leads?.length || 0 });
-  return d || null;
-}
-
-function buildCF({ email, phone }: { email?: string; phone?: string }) {
-  const cf: any[] = [];
-  if (email) cf.push({ field_code: 'EMAIL', values: [{ value: email, enum_code: 'WORK' }] });
-  if (phone) cf.push({ field_code: 'PHONE', values: [{ value: phone, enum_code: 'WORK' }] });
-  return cf;
-}
-
-async function createContact(ctx: string, input: { name?: string; email?: string; phone?: string; }) {
-  const payload = [{
-    name: input.name || input.email || input.phone || 'Contacto',
-    custom_fields_values: (() => {
-      const cf = buildCF({ email: input.email, phone: input.phone });
-      return cf.length ? cf : undefined;
-    })(),
-  }];
-  const res = await kommoFetch(`${ctx}:create-contact`, 'contacts', { method: 'POST', body: JSON.stringify(payload) });
-  const d = await res.json().catch(() => ({}));
-  const contact = d?._embedded?.contacts?.[0];
-  if (!contact?.id) throw new Error('createContact: response without id');
-  log(ctx, 'create-contact_ok', { id: contact.id });
-  return contact;
-}
-
-async function updateContact(ctx: string, id: number, input: { name?: string; email?: string; phone?: string }) {
-  const payload: any = [{
-    id,
-    ...(input.name ? { name: input.name } : {}),
-  }];
-
-  const cf = buildCF({ email: input.email, phone: input.phone });
-  if (cf.length) payload[0].custom_fields_values = cf;
-
-  const res = await kommoFetch(`${ctx}:update-contact`, 'contacts', { method: 'PATCH', body: JSON.stringify(payload) });
-  const d = await res.json().catch(() => ({}));
-  log(ctx, 'update-contact_ok', { id, fields: Object.keys(input).filter(k => (input as any)[k]) });
-  return d;
-}
-
-/** ====== Acciones ====== */
-
-/** 1) Crear LEAD (sin contacto) */
-type CreateLeadInput = {
-  name?: string; price?: number; pipeline_id?: number; status_id?: number;
-  tags?: string[]; source?: string; notes?: string; custom_fields?: Record<string, any>;
-};
-async function handleCreateLead(ctx: string, body: any) {
-  const input: CreateLeadInput = body || {};
-
-  // Sanitiza IDs: solo incluye si son > 0 (Kommo rechaza 0)
-  const pipelineId =
-    Number.isFinite(input.pipeline_id) && Number(input.pipeline_id) > 0
-      ? Number(input.pipeline_id)
-      : undefined;
-  const statusId =
-    Number.isFinite(input.status_id) && Number(input.status_id) > 0
-      ? Number(input.status_id)
-      : undefined;
-
-  if (input.pipeline_id && !pipelineId) {
-    log(ctx, 'create-lead_sanitize', { dropped: 'pipeline_id', value: input.pipeline_id });
-  }
-  if (input.status_id && !statusId) {
-    log(ctx, 'create-lead_sanitize', { dropped: 'status_id', value: input.status_id });
-  }
-
-  const payload = [{
-    name: input.name || 'Nuevo lead',
-    price: typeof input.price === 'number' ? input.price : undefined,
-    pipeline_id: pipelineId,
-    status_id: statusId,
-    tags: Array.isArray(input.tags) && input.tags.length
-      ? input.tags.map((t) => ({ name: String(t) }))
-      : undefined,
-    custom_fields_values: input.custom_fields
-      ? Object.entries(input.custom_fields).map(([code, value]) => ({ field_code: code, values: [{ value }] }))
-      : undefined,
-  }];
-
-  const res = await kommoFetch(`${ctx}:create-lead`, 'leads', { method: 'POST', body: JSON.stringify(payload) });
-  const d = await res.json().catch(() => ({}));
-  const lead = d?._embedded?.leads?.[0];
-  if (!lead?.id) throw new Error('createLead: response without id');
-
-  if (input.source) await addLeadNote(ctx, lead.id, `Origen: ${input.source}`);
-  if (input.notes)  await addLeadNote(ctx, lead.id, input.notes);
-
-  log(ctx, 'create-lead_ok', { id: lead.id });
-  return { ok: true, lead_id: lead.id };
-}
-
-/** 2) Actualizar LEAD (precio, etapa, tags, custom) */
-async function handleUpdateLead(ctx: string, body: any) {
-  const id = Number(body?.lead_id);
-  if (!Number.isFinite(id) || id <= 0) throw new Error('lead_id required');
-
-  const patch: any = {};
-  if (typeof body?.price === 'number') patch.price = body.price;
-
-  if (Number.isFinite(body?.pipeline_id) && Number(body.pipeline_id) > 0) {
-    patch.pipeline_id = Number(body.pipeline_id);
-  } else if (body?.pipeline_id !== undefined) {
-    log(ctx, 'update-lead_sanitize', { dropped: 'pipeline_id', value: body.pipeline_id });
-  }
-
-  if (Number.isFinite(body?.status_id) && Number(body.status_id) > 0) {
-    patch.status_id = Number(body.status_id);
-  } else if (body?.status_id !== undefined) {
-    log(ctx, 'update-lead_sanitize', { dropped: 'status_id', value: body.status_id });
-  }
-
-  if (Array.isArray(body?.tags)) {
-    const tags = body.tags.map((t: any) => ({ name: String(t) })).filter((t: any) => t.name.trim().length);
-    if (tags.length) patch.tags = tags;
-  }
-
-  if (body?.custom_fields) {
-    patch.custom_fields_values = Object.entries(body.custom_fields).map(([code, value]) => ({
-      field_code: code, values: [{ value }]
-    }));
-  }
-
-  await updateLead(ctx, id, patch);
-  if (body?.notes) await addLeadNote(ctx, id, String(body.notes));
-  return { ok: true, lead_id: id };
-}
-
-/** 3) Crear/Actualizar CONTACTO y vincularlo al LEAD */
-async function handleAttachContact(ctx: string, body: any) {
-  const leadId = Number(body?.lead_id);
-  if (!Number.isFinite(leadId) || leadId <= 0) throw new Error('lead_id required');
-
-  const name  = body?.name  ? String(body.name)  : undefined;
-  const email = body?.email ? String(body.email) : undefined;
-  const phone = body?.phone ? String(body.phone) : undefined;
-
-  if (!name && !email && !phone) throw new Error('provide name/email/phone');
-
-  // 1) obten lead y posible contacto vinculado
-  const lead = await getLead(ctx, leadId);
-  let contactId: number | null = lead?._embedded?.contacts?.[0]?.id ? Number(lead._embedded.contacts[0].id) : null;
-
-  // 2) si no hay, intenta encontrar por email/phone
-  if (!contactId && (email || phone)) {
-    const q = email || phone!;
-    const found = await findContactByQuery(ctx, q);
-    if (found?.id) contactId = Number(found.id);
-  }
-
-  // 3) crear o actualizar contacto
-  if (!contactId) {
-    const c = await createContact(ctx, { name, email, phone });
-    contactId = Number(c.id);
-  } else {
-    await updateContact(ctx, contactId, { name, email, phone });
-  }
-
-  // 4) vincular al lead (aunque ya exista el vínculo)
-  await updateLead(ctx, leadId, { _embedded: { contacts: [{ id: contactId }] } });
-
-  // 5) opcional: nota
-  if (body?.notes) await addLeadNote(ctx, leadId, String(body.notes));
-
-  log(ctx, 'attach-contact_done', { leadId, contactId });
-  return { ok: true, lead_id: leadId, contact_id: contactId };
-}
-
-/** 4) Agregar NOTA */
-async function handleAddNote(ctx: string, body: any) {
-  const leadId = Number(body?.lead_id);
-  const text = String(body?.text || '').trim();
-  if (!leadId || !text) throw new Error('lead_id and text required');
-  await addLeadNote(ctx, leadId, text);
-  return { ok: true, lead_id: leadId };
-}
-
-/** 5) Adjuntar TRANSCRIPT (troceado) */
-async function handleAttachTranscript(ctx: string, body: any) {
-  const leadId = Number(body?.lead_id);
-  const transcript: string = String(body?.transcript || '').trim();
-  const title: string | undefined = body?.title;
-  if (!leadId || !transcript) throw new Error('lead_id and transcript required');
-
-  const header = `📎 Conversación completa${title ? ` — ${title}` : ''}\nFecha: ${new Date().toISOString()}`;
-  await addLeadNote(ctx, leadId, header);
-
-  let CHUNK = 1200;
-  const MAX_TRIES_PER_CHUNK = 2;
-  let sent = 0;
-
-  for (let i = 0; i < transcript.length; i += CHUNK) {
-    const slice = transcript.slice(i, i + CHUNK);
-    let ok = false;
-
-    for (let t = 0; t < MAX_TRIES_PER_CHUNK && !ok; t++) {
-      try {
-        log(ctx, 'attach-transcript_chunk_try', { indexStart: i, len: slice.length, try: t + 1, chunkSize: CHUNK, leadId });
-        await addLeadNote(ctx, leadId, slice);
-        ok = true;
-        sent++;
-      } catch (e: any) {
-        const msg = String(e?.message || '');
-        log(ctx, 'attach-transcript_chunk_error', { err: preview(msg, 300), indexStart: i, chunkSize: CHUNK, leadId });
-        if (msg.includes(' 413 ') && CHUNK > 600) {
-          CHUNK = Math.max(600, Math.floor(CHUNK * 0.66));
-        } else {
-          await sleep(300);
-        }
-      }
-    }
-
-    if (!ok) throw new Error('attach-transcript failed after retries');
-    await sleep(200);
-  }
-
-  log(ctx, 'attach-transcript_done', { fragments: sent, finalChunkSize: CHUNK, leadId });
-  return { ok: true, lead_id: leadId, chunks: sent };
-}
-
-/** ====== Auth puente ====== */
-function authOk(req: VercelRequest) {
-  const h = String(req.headers['x-bridge-secret'] || '');
-  const q = String((req.query as any)?.secret || '');
-  return BRIDGE_SECRET && (h === BRIDGE_SECRET || q === BRIDGE_SECRET);
-}
-
-/** ====== Handler principal (router) ====== */
-export default async function handler(req: VercelRequest, res: VercelResponse) {
-  const ctx = `kommo:${rid()}`;
+export default async function handler(req: NextApiRequest, res: NextApiResponse<OkRes | ErrRes>) {
   try {
-    if (req.method !== 'POST') return res.status(405).json({ error: 'method_not_allowed' });
-    if (!authOk(req)) {
-      log(ctx, 'auth_failed', { reason: 'bridge secret mismatch' });
-      return res.status(401).json({ error: 'unauthorized' });
+    const secret =
+      (req.query?.secret as string) ||
+      (req.headers['x-bridge-secret'] as string) ||
+      (req.headers['x-webhook-secret'] as string) ||
+      '';
+
+    if (!WEBHOOK_SECRET || secret !== WEBHOOK_SECRET) {
+      console.error('hub:kommo secret_mismatch');
+      return res.status(401).json({ ok: false, error: 'unauthorized' });
+    }
+    if (!KOMMO_BASE_URL || !KOMMO_ACCESS_TOKEN) {
+      console.error('hub:kommo missing_env');
+      return res.status(500).json({ ok: false, error: 'missing kommo env' });
     }
 
-    const body = typeof req.body === 'object' ? req.body : JSON.parse(String(req.body || '{}'));
-    const action = String(body?.action || (req.query as any)?.action || '').trim();
-    log(ctx, 'request_received', { action, hasBody: !!body, baseUrl: kommoBase() });
+    if (req.method !== 'POST') {
+      return res.status(200).json({ ok: true, data: { pong: true } });
+    }
 
-    if (action === 'create-lead')       return res.status(200).json(await handleCreateLead(ctx, body));
-    if (action === 'update-lead')       return res.status(200).json(await handleUpdateLead(ctx, body));
-    if (action === 'attach-contact')    return res.status(200).json(await handleAttachContact(ctx, body));
-    if (action === 'add-note')          return res.status(200).json(await handleAddNote(ctx, body));
-    if (action === 'attach-transcript') return res.status(200).json(await handleAttachTranscript(ctx, body));
+    const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body || {};
+    const action = body?.action as
+      | 'create-lead'
+      | 'update-lead'
+      | 'attach-contact'
+      | 'add-note'
+      | 'attach-transcript';
 
-    return res.status(400).json({ error: 'unknown_action', hint: 'use action=create-lead|update-lead|attach-contact|add-note|attach-transcript' });
+    console.log('hub:kommo action=', action);
+
+    const r = await routeKommoAction(action, body);
+    return res.status(r.http || 200).json(r.json as any);
   } catch (e: any) {
-    log(ctx, 'handler_error', { err: preview(e?.message || e, 800) });
-    return res.status(500).json({ error: e?.message || 'server_error' });
+    console.error('hub:kommo error', e?.stack || e);
+    return res.status(500).json({ ok: false, error: 'exception', detail: String(e?.message || e) });
+  }
+}
+
+async function routeKommoAction(action: string, payload: any): Promise<{ http: number; json: OkRes | ErrRes }> {
+  const headers = {
+    Authorization: `Bearer ${KOMMO_ACCESS_TOKEN}`,
+    'Content-Type': 'application/json',
+    Accept: 'application/json',
+  };
+
+  const fetchKommo = async (url: string, init?: RequestInit) => {
+    const full = `${KOMMO_BASE_URL}${url}`;
+    const resp = await fetch(full, { ...(init || {}), headers: { ...headers, ...(init?.headers || {}) } });
+    const json = await resp.json().catch(() => ({}));
+    return { status: resp.status, json };
+  };
+
+  try {
+    if (action === 'create-lead') {
+      const name = payload?.name || 'Nuevo lead';
+      const price = payload?.price || 0;
+      const notes = payload?.notes || '';
+      const source = payload?.source || 'webchat';
+
+      const { status, json } = await fetchKommo('/api/v4/leads', {
+        method: 'POST',
+        body: JSON.stringify([{ name, price, _embedded: { tags: [{ name: source }] } }]),
+      });
+
+      console.log('kommo:create-lead status=', status, 'body=', safeBody(json));
+      if (status >= 200 && status < 300) {
+        const leadId = json?._embedded?.leads?.[0]?.id;
+        if (notes) {
+          await fetchKommo('/api/v4/leads/notes', {
+            method: 'POST',
+            body: JSON.stringify([{ entity_id: leadId, note_type: 'common', params: { text: notes } }]),
+          });
+        }
+        return { http: 200, json: { ok: true, data: { lead_id: leadId } } };
+      }
+      return { http: status, json: { ok: false, error: 'kommo create-lead failed', detail: json } };
+    }
+
+    if (action === 'update-lead') {
+      const leadId = Number(payload?.lead_id);
+      const price = payload?.price;
+      const tags: string[] = payload?.tags || [];
+
+      const patch: any = {};
+      if (typeof price === 'number') patch.price = price;
+
+      const { status, json } = await fetchKommo('/api/v4/leads', {
+        method: 'PATCH',
+        body: JSON.stringify([{ id: leadId, ...patch }]),
+      });
+
+      console.log('kommo:update-lead status=', status, 'body=', safeBody(json));
+      if (status >= 200 && status < 300) {
+        if (Array.isArray(tags) && tags.length) {
+          // tagging simple (opcional)
+          await fetchKommo(`/api/v4/leads/${leadId}/link`, {
+            method: 'POST',
+            body: JSON.stringify({ to_entity_id: leadId, to_entity_type: 'leads', metadata: { tags } }),
+          }).catch(() => null);
+        }
+        return { http: 200, json: { ok: true, data: { lead_id: leadId } } };
+      }
+      return { http: status, json: { ok: false, error: 'kommo update-lead failed', detail: json } };
+    }
+
+    if (action === 'attach-contact') {
+      const leadId = Number(payload?.lead_id);
+      const name = String(payload?.name || '').trim() || 'Contacto';
+      const email: string | null = payload?.email ? String(payload.email).toLowerCase() : null;
+      const phone: string | null = payload?.phone ? String(payload.phone) : null;
+      const notes: string | null = payload?.notes || null;
+
+      // 1) crear contacto
+      const contactBody: any = { name, custom_fields_values: [] as any[] };
+      if (email) contactBody.custom_fields_values.push({ field_code: 'EMAIL', values: [{ value: email }] });
+      if (phone) contactBody.custom_fields_values.push({ field_code: 'PHONE', values: [{ value: phone }] });
+
+      const { status: cStatus, json: cJson } = await fetchKommo('/api/v4/contacts', {
+        method: 'POST',
+        body: JSON.stringify([contactBody]),
+      });
+      console.log('kommo:contact status=', cStatus, 'body=', safeBody(cJson));
+      if (cStatus < 200 || cStatus >= 300) {
+        return { http: cStatus, json: { ok: false, error: 'kommo contact failed', detail: cJson } };
+      }
+      const contactId = cJson?._embedded?.contacts?.[0]?.id;
+
+      // 2) vincular a lead
+      const { status: lStatus, json: lJson } = await fetchKommo(`/api/v4/leads/${leadId}/link`, {
+        method: 'POST',
+        body: JSON.stringify([{ to_entity_id: contactId, to_entity_type: 'contacts' }]),
+      });
+      console.log('kommo:link status=', lStatus, 'body=', safeBody(lJson));
+
+      // 3) nota opcional
+      if (notes) {
+        await fetchKommo('/api/v4/leads/notes', {
+          method: 'POST',
+          body: JSON.stringify([{ entity_id: leadId, note_type: 'common', params: { text: notes } }]),
+        }).catch(() => null);
+      }
+
+      if (lStatus >= 200 && lStatus < 300) {
+        return { http: 200, json: { ok: true, data: { lead_id: leadId, contact_id: contactId } } };
+      }
+      return { http: lStatus, json: { ok: false, error: 'kommo link failed', detail: lJson } };
+    }
+
+    if (action === 'add-note') {
+      const leadId = Number(payload?.lead_id);
+      const text = String(payload?.text || '').slice(0, 15000);
+      const { status, json } = await fetchKommo('/api/v4/leads/notes', {
+        method: 'POST',
+        body: JSON.stringify([{ entity_id: leadId, note_type: 'common', params: { text } }]),
+      });
+      console.log('kommo:add-note status=', status, 'body=', safeBody(json));
+      if (status >= 200 && status < 300) {
+        return { http: 200, json: { ok: true, data: { lead_id: leadId } } };
+      }
+      return { http: status, json: { ok: false, error: 'kommo add-note failed', detail: json } };
+    }
+
+    if (action === 'attach-transcript') {
+      const leadId = Number(payload?.lead_id);
+      const transcript: string = String(payload?.transcript || '');
+      const chunks = chunk(transcript, 8000);
+      for (let i = 0; i < chunks.length; i++) {
+        const { status } = await fetchKommo('/api/v4/leads/notes', {
+          method: 'POST',
+          body: JSON.stringify([
+            { entity_id: leadId, note_type: 'common', params: { text: `Transcripción (${i + 1}/${chunks.length}):\n\n${chunks[i]}` } },
+          ]),
+        });
+        if (status < 200 || status >= 300) break;
+      }
+      return { http: 200, json: { ok: true, data: { lead_id: leadId } } };
+    }
+
+    return { http: 400, json: { ok: false, error: 'unknown action' } };
+  } catch (e: any) {
+    return { http: 500, json: { ok: false, error: 'exception', detail: String(e?.message || e) } };
+  }
+}
+
+function chunk(s: string, n: number): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < s.length; i += n) out.push(s.slice(i, i + n));
+  return out;
+}
+function safeBody(j: any) {
+  try {
+    const clone = JSON.parse(JSON.stringify(j || {}));
+    if (clone?.access_token) clone.access_token = '***';
+    return clone;
+  } catch {
+    return {};
   }
 }
