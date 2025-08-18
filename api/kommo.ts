@@ -6,6 +6,9 @@ const KOMMO_BASE_URL =
   (process.env.KOMMO_SUBDOMAIN ? `https://${process.env.KOMMO_SUBDOMAIN}.kommo.com` : '');
 const KOMMO_ACCESS_TOKEN = process.env.KOMMO_ACCESS_TOKEN || '';
 
+const EMAIL_FIELD_ID = process.env.KOMMO_EMAIL_FIELD_ID ? Number(process.env.KOMMO_EMAIL_FIELD_ID) : undefined;
+const PHONE_FIELD_ID = process.env.KOMMO_PHONE_FIELD_ID ? Number(process.env.KOMMO_PHONE_FIELD_ID) : undefined;
+
 type OkRes = { ok: true; data?: any };
 type ErrRes = { ok: false; error: string; detail?: any };
 
@@ -62,19 +65,26 @@ async function routeKommoAction(action: string, payload: any): Promise<{ http: n
     return { status: resp.status, json };
   };
 
+  const mustId = (v: any, name: string) => {
+    const n = Number(v);
+    if (!Number.isFinite(n) || n <= 0) throw new Error(`invalid_${name}: ${v}`);
+    return n;
+  };
+
   try {
+    // ---------- CREATE LEAD ----------
     if (action === 'create-lead') {
       const name = payload?.name || 'Nuevo lead';
-      const price = payload?.price || 0;
-      const notes = payload?.notes || '';
+      const price = Number.isFinite(Number(payload?.price)) ? Number(payload.price) : 0;
+      const notes = (payload?.notes ? String(payload.notes) : '').trim();
       const source = payload?.source || 'webchat';
 
       const { status, json } = await fetchKommo('/api/v4/leads', {
         method: 'POST',
         body: JSON.stringify([{ name, price, _embedded: { tags: [{ name: source }] } }]),
       });
-
       console.log('kommo:create-lead status=', status, 'body=', safeBody(json));
+
       if (status >= 200 && status < 300) {
         const leadId = json?._embedded?.leads?.[0]?.id;
         if (notes) {
@@ -88,44 +98,51 @@ async function routeKommoAction(action: string, payload: any): Promise<{ http: n
       return { http: status, json: { ok: false, error: 'kommo create-lead failed', detail: json } };
     }
 
+    // ---------- UPDATE LEAD ----------
     if (action === 'update-lead') {
-      const leadId = Number(payload?.lead_id);
-      const price = payload?.price;
-      const tags: string[] = payload?.tags || [];
-
+      const leadId = mustId(payload?.lead_id, 'lead_id');
       const patch: any = {};
-      if (typeof price === 'number') patch.price = price;
+      if (Number.isFinite(Number(payload?.price))) patch.price = Number(payload.price);
 
       const { status, json } = await fetchKommo('/api/v4/leads', {
         method: 'PATCH',
         body: JSON.stringify([{ id: leadId, ...patch }]),
       });
-
       console.log('kommo:update-lead status=', status, 'body=', safeBody(json));
+
       if (status >= 200 && status < 300) {
-        if (Array.isArray(tags) && tags.length) {
-          // tagging simple (opcional)
-          await fetchKommo(`/api/v4/leads/${leadId}/link`, {
-            method: 'POST',
-            body: JSON.stringify({ to_entity_id: leadId, to_entity_type: 'leads', metadata: { tags } }),
-          }).catch(() => null);
-        }
         return { http: 200, json: { ok: true, data: { lead_id: leadId } } };
       }
       return { http: status, json: { ok: false, error: 'kommo update-lead failed', detail: json } };
     }
 
+    // ---------- ATTACH CONTACT ----------
     if (action === 'attach-contact') {
-      const leadId = Number(payload?.lead_id);
+      const leadId = mustId(payload?.lead_id, 'lead_id');
       const name = String(payload?.name || '').trim() || 'Contacto';
       const email: string | null = payload?.email ? String(payload.email).toLowerCase() : null;
-      const phone: string | null = payload?.phone ? String(payload.phone) : null;
-      const notes: string | null = payload?.notes || null;
+      const phoneRaw: string | null = payload?.phone ? String(payload.phone) : null;
+      const phone = phoneRaw ? normalizePhone(phoneRaw) : null;
+      const notes: string | null = payload?.notes ? String(payload.notes) : null;
 
-      // 1) crear contacto
-      const contactBody: any = { name, custom_fields_values: [] as any[] };
-      if (email) contactBody.custom_fields_values.push({ field_code: 'EMAIL', values: [{ value: email }] });
-      if (phone) contactBody.custom_fields_values.push({ field_code: 'PHONE', values: [{ value: phone }] });
+      // 1) crear contacto (con fallback a field_id si la cuenta no acepta field_code)
+      const cfv: any[] = [];
+      if (email) {
+        cfv.push(
+          EMAIL_FIELD_ID
+            ? { field_id: EMAIL_FIELD_ID, values: [{ value: email }] }
+            : { field_code: 'EMAIL', values: [{ value: email }] }
+        );
+      }
+      if (phone) {
+        cfv.push(
+          PHONE_FIELD_ID
+            ? { field_id: PHONE_FIELD_ID, values: [{ value: phone }] }
+            : { field_code: 'PHONE', values: [{ value: phone }] }
+        );
+      }
+
+      const contactBody: any = { name, ...(cfv.length ? { custom_fields_values: cfv } : {}) };
 
       const { status: cStatus, json: cJson } = await fetchKommo('/api/v4/contacts', {
         method: 'POST',
@@ -136,13 +153,32 @@ async function routeKommoAction(action: string, payload: any): Promise<{ http: n
         return { http: cStatus, json: { ok: false, error: 'kommo contact failed', detail: cJson } };
       }
       const contactId = cJson?._embedded?.contacts?.[0]?.id;
+      const cid = mustId(contactId, 'contact_id');
 
-      // 2) vincular a lead
-      const { status: lStatus, json: lJson } = await fetchKommo(`/api/v4/leads/${leadId}/link`, {
+      // 2) vincular a lead — intento #1
+      let { status: lStatus, json: lJson } = await fetchKommo(`/api/v4/leads/${leadId}/link`, {
         method: 'POST',
-        body: JSON.stringify([{ to_entity_id: contactId, to_entity_type: 'contacts' }]),
+        body: JSON.stringify([{ to_entity_id: cid, to_entity_type: 'contacts' }]),
       });
-      console.log('kommo:link status=', lStatus, 'body=', safeBody(lJson));
+      console.log('kommo:link[1] status=', lStatus, 'body=', safeBody(lJson));
+
+      // Retry con formato global si 400
+      if (lStatus === 400) {
+        const retry = await fetchKommo(`/api/v4/links`, {
+          method: 'POST',
+          body: JSON.stringify([
+            {
+              from_entity_id: leadId,
+              from_entity_type: 'leads',
+              to_entity_id: cid,
+              to_entity_type: 'contacts',
+            },
+          ]),
+        });
+        lStatus = retry.status;
+        lJson = retry.json;
+        console.log('kommo:link[2] status=', lStatus, 'body=', safeBody(lJson));
+      }
 
       // 3) nota opcional
       if (notes) {
@@ -153,28 +189,35 @@ async function routeKommoAction(action: string, payload: any): Promise<{ http: n
       }
 
       if (lStatus >= 200 && lStatus < 300) {
-        return { http: 200, json: { ok: true, data: { lead_id: leadId, contact_id: contactId } } };
+        return { http: 200, json: { ok: true, data: { lead_id: leadId, contact_id: cid } } };
       }
       return { http: lStatus, json: { ok: false, error: 'kommo link failed', detail: lJson } };
     }
 
+    // ---------- ADD NOTE ----------
     if (action === 'add-note') {
-      const leadId = Number(payload?.lead_id);
-      const text = String(payload?.text || '').slice(0, 15000);
+      const leadId = mustId(payload?.lead_id, 'lead_id');
+      const text = String(payload?.text || '').trim();
+      if (!text) return { http: 400, json: { ok: false, error: 'empty_note' } };
+
       const { status, json } = await fetchKommo('/api/v4/leads/notes', {
         method: 'POST',
         body: JSON.stringify([{ entity_id: leadId, note_type: 'common', params: { text } }]),
       });
       console.log('kommo:add-note status=', status, 'body=', safeBody(json));
+
       if (status >= 200 && status < 300) {
         return { http: 200, json: { ok: true, data: { lead_id: leadId } } };
       }
       return { http: status, json: { ok: false, error: 'kommo add-note failed', detail: json } };
     }
 
+    // ---------- ATTACH TRANSCRIPT ----------
     if (action === 'attach-transcript') {
-      const leadId = Number(payload?.lead_id);
-      const transcript: string = String(payload?.transcript || '');
+      const leadId = mustId(payload?.lead_id, 'lead_id');
+      const transcript: string = String(payload?.transcript || '').trim();
+      if (!transcript) return { http: 200, json: { ok: true, data: { lead_id: leadId } } };
+
       const chunks = chunk(transcript, 8000);
       for (let i = 0; i < chunks.length; i++) {
         const { status } = await fetchKommo('/api/v4/leads/notes', {
@@ -194,6 +237,7 @@ async function routeKommoAction(action: string, payload: any): Promise<{ http: n
   }
 }
 
+// ===== Helpers =====
 function chunk(s: string, n: number): string[] {
   const out: string[] = [];
   for (let i = 0; i < s.length; i += n) out.push(s.slice(i, i + n));
@@ -207,4 +251,9 @@ function safeBody(j: any) {
   } catch {
     return {};
   }
+}
+function normalizePhone(phone: string): string {
+  const p = phone.replace(/[^\d+]/g, '');
+  if (!p.startsWith('+') && /^\d+$/.test(p)) return `+${p}`;
+  return p;
 }
