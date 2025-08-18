@@ -61,20 +61,30 @@ async function kommoFetch(
   log(ctx, 'kommo_request', { method: init.method || 'GET', url, attempt, bodyPreview });
 
   const res = await fetch(url, { ...init, headers });
-  const text = await res.text().catch(() => '');
-  const isJson = text.startsWith('{') || text.startsWith('[');
-  const body = isJson ? (() => { try { return JSON.parse(text); } catch { return text; } })() : text;
+
+  // Leer respuesta cruda para log y reconstrucción segura
+  const rawText = await res.text().catch(() => '');
+  const isJsonLike = rawText.startsWith('{') || rawText.startsWith('[');
+  const parsed = isJsonLike ? (() => { try { return JSON.parse(rawText); } catch { return rawText; } })() : rawText;
 
   if (res.ok) {
-    log(ctx, 'kommo_response_ok', { status: res.status, url, bodyPreview: preview(body, 400) });
-    return new Response(isJson ? JSON.stringify(body) : String(body), {
+    // 204 NO CONTENT: NO devolver body (si pasas body en 204, Response() lanza error)
+    if (res.status === 204) {
+      log(ctx, 'kommo_response_ok', { status: res.status, url, bodyPreview: '<no content>' });
+      return new Response(null, { status: 204 });
+    }
+
+    log(ctx, 'kommo_response_ok', { status: res.status, url, bodyPreview: preview(parsed, 400) });
+
+    const outBody = isJsonLike ? JSON.stringify(parsed) : (typeof parsed === 'string' ? parsed : String(parsed));
+    return new Response(outBody, {
       status: res.status,
-      headers: { 'content-type': res.headers.get('content-type') || 'application/json' }
+      headers: { 'content-type': res.headers.get('content-type') || (isJsonLike ? 'application/json' : 'text/plain') }
     });
   }
 
   const retriable = res.status === 429 || res.status >= 500;
-  log(ctx, 'kommo_response_error', { status: res.status, url, attempt, retriable, bodyPreview: preview(body, 600) });
+  log(ctx, 'kommo_response_error', { status: res.status, url, attempt, retriable, bodyPreview: preview(parsed, 600) });
 
   if (retriable && attempt < 3) {
     const delay = 300 * (attempt + 1);
@@ -82,7 +92,7 @@ async function kommoFetch(
     return kommoFetch(ctx, path, init, attempt + 1);
   }
 
-  throw new Error(`${path} ${res.status}: ${typeof body === 'string' ? body : JSON.stringify(body)}`);
+  throw new Error(`${path} ${res.status}: ${typeof parsed === 'string' ? parsed : JSON.stringify(parsed)}`);
 }
 
 /** ====== Helpers Kommo ====== */
@@ -112,9 +122,16 @@ async function findContactByQuery(ctx: string, query: string) {
     `contacts?query=${encodeURIComponent(query)}&with=leads&limit=1`,
     { method: 'GET' }
   );
+
+  // 204 → no hay resultados
+  if (res.status === 204) {
+    log(ctx, 'find-contact_result', { query, found_id: null, leads_count: 0 });
+    return null;
+  }
+
   const d = await res.json().catch(() => ({}));
   const contact = d?._embedded?.contacts?.[0] || null;
-  log(ctx, 'find-contact_result', { query, found_id: contact?.id || null });
+  log(ctx, 'find-contact_result', { query, found_id: contact?.id || null, leads_count: contact?._embedded?.leads?.length || 0 });
   return contact;
 }
 
@@ -262,14 +279,18 @@ async function handleAttachContact(ctx: string, body: any) {
 
   if (!name && !email && !phone) throw new Error('provide name/email/phone');
 
+  // 1) obten lead y posible contacto vinculado
   const lead = await getLead(ctx, leadId);
   let contactId: number | null = lead?._embedded?.contacts?.[0]?.id ? Number(lead._embedded.contacts[0].id) : null;
 
+  // 2) si no hay, intenta encontrar por email/phone
   if (!contactId && (email || phone)) {
-    const found = await findContactByQuery(ctx, email || phone!);
+    const q = email || phone!;
+    const found = await findContactByQuery(ctx, q);
     if (found?.id) contactId = Number(found.id);
   }
 
+  // 3) crear o actualizar contacto
   if (!contactId) {
     const c = await createContact(ctx, { name, email, phone });
     contactId = Number(c.id);
@@ -277,8 +298,10 @@ async function handleAttachContact(ctx: string, body: any) {
     await updateContact(ctx, contactId, { name, email, phone });
   }
 
+  // 4) vincular al lead (aunque ya exista el vínculo)
   await updateLead(ctx, leadId, { _embedded: { contacts: [{ id: contactId }] } });
 
+  // 5) opcional: nota
   if (body?.notes) await addLeadNote(ctx, leadId, String(body.notes));
 
   log(ctx, 'attach-contact_done', { leadId, contactId });
