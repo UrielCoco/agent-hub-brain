@@ -1,7 +1,8 @@
-import type { NextApiRequest, NextApiResponse } from 'next';
+// api/kommo.ts
+import type { VercelRequest, VercelResponse } from '@vercel/node';
 
 const KOMMO_BASE_URL = (process.env.KOMMO_BASE_URL || '').trim();
-const KOMMO_SUBDOMAIN = (process.env.KOMMO_SUBDOMAIN || '').trim(); // opcional
+const KOMMO_SUBDOMAIN = (process.env.KOMMO_SUBDOMAIN || '').trim();
 const KOMMO_ACCESS_TOKEN = process.env.KOMMO_ACCESS_TOKEN || '';
 const BRIDGE_SECRET = process.env.WEBHOOK_SECRET || '';
 
@@ -12,8 +13,9 @@ function kommoBase() {
 }
 function apiV4(p: string) { return `${kommoBase()}/api/v4/${p.replace(/^\/+/, '')}`; }
 function hdrs() { return { Authorization: `Bearer ${KOMMO_ACCESS_TOKEN}`, 'Content-Type': 'application/json' }; }
-function authOk(req: NextApiRequest) {
-  const h = String(req.headers['x-bridge-secret'] || ''); const q = String((req.query as any)?.secret || '');
+function authOk(req: VercelRequest) {
+  const h = String(req.headers['x-bridge-secret'] || '');
+  const q = String((req.query as any)?.secret || '');
   return BRIDGE_SECRET && (h === BRIDGE_SECRET || q === BRIDGE_SECRET);
 }
 
@@ -74,18 +76,49 @@ async function createLead(input: UpsertLeadInput, contactId?: number) {
   return lead;
 }
 
-export default async function handler(req: NextApiRequest, res: NextApiResponse) {
+async function handleUpsert(body: any) {
+  const input: UpsertLeadInput = body || {};
+  const contact = await upsertContact({ name: input.name, email: input.email, phone: input.phone });
+  const contactId = contact?.id ? Number(contact.id) : undefined;
+  const lead = await createLead(input, contactId);
+  if (input.notes) await addLeadNote(lead.id, input.notes);
+  return { ok: true, lead_id: lead.id, contact_id: contactId };
+}
+
+async function handleAddNote(body: any) {
+  const leadId = Number(body?.lead_id); const text = String(body?.text || '').trim();
+  if (!leadId || !text) throw new Error('lead_id and text required');
+  await addLeadNote(leadId, text);
+  return { ok: true };
+}
+
+async function handleAttachTranscript(body: any) {
+  const leadId = Number(body?.lead_id);
+  const transcript: string = String(body?.transcript || '').trim();
+  const title: string | undefined = body?.title;
+  if (!leadId || !transcript) throw new Error('lead_id and transcript required');
+  const header = `📎 Conversación completa${title ? ` — ${title}` : ''}\nFecha: ${new Date().toISOString()}`;
+  await addLeadNote(leadId, header);
+  const CHUNK = 3500;
+  for (let i = 0; i < transcript.length; i += CHUNK) {
+    await addLeadNote(leadId, transcript.slice(i, i + CHUNK));
+  }
+  return { ok: true, chunks: Math.ceil(transcript.length / CHUNK) };
+}
+
+export default async function handler(req: VercelRequest, res: VercelResponse) {
+  if (!authOk(req)) return res.status(401).json({ error: 'unauthorized' });
+  if (req.method !== 'POST') return res.status(405).json({ error: 'method_not_allowed' });
+
   try {
-    if (!authOk(req)) return res.status(401).json({ error: 'unauthorized' });
-    if (req.method !== 'POST') return res.status(405).json({ error: 'method_not_allowed' });
+    const body = typeof req.body === 'object' ? req.body : JSON.parse(String(req.body || '{}'));
+    const action = String(body?.action || (req.query as any)?.action || '').trim();
 
-    const input = typeof req.body === 'object' ? req.body : JSON.parse(String(req.body || '{}'));
-    const contact = await upsertContact({ name: input.name, email: input.email, phone: input.phone });
-    const contactId = contact?.id ? Number(contact.id) : undefined;
-    const lead = await createLead(input, contactId);
-    if (input.notes) await addLeadNote(lead.id, input.notes);
+    if (action === 'upsert')              return res.status(200).json(await handleUpsert(body));
+    if (action === 'add-note')            return res.status(200).json(await handleAddNote(body));
+    if (action === 'attach-transcript')   return res.status(200).json(await handleAttachTranscript(body));
 
-    return res.status(200).json({ ok: true, lead_id: lead.id, contact_id: contactId });
+    return res.status(400).json({ error: 'unknown_action', hint: 'use action=upsert|add-note|attach-transcript' });
   } catch (e: any) {
     return res.status(500).json({ error: e?.message || 'server_error' });
   }
