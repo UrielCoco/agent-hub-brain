@@ -1,10 +1,9 @@
 // api/hub.ts — ÚNICA función del Hub (Vercel Serverless/Edge-friendly)
-// - Sin imports de 'next' ni 'node-fetch'
-// - Usa Web Request/Response nativos
-// - Action Router: itinerary.build | quote | render | send
-// - Header requerido: x-hub-secret = process.env.HUB_BRAIN_SECRET
+// - Acepta secreto desde HUB_BRAIN_SECRET o HUB_BRIDGE_SECRET
+// - Header requerido: x-hub-secret
+// - Actions: itinerary.build | quote | render | send
 
-export const config = { runtime: "edge" }; // o quítalo si prefieres Node runtime
+export const config = { runtime: "edge" }; // puedes remover si prefieres Node runtime
 
 type Json = Record<string, any>;
 
@@ -15,10 +14,18 @@ function json(status: number, data: Json) {
   });
 }
 
+// ✅ PATCH Opción A: aceptar HUB_BRAIN_SECRET o HUB_BRIDGE_SECRET
 function assertSecret(req: Request) {
-  const secret = (process.env.HUB_BRAIN_SECRET || "").trim();
-  const got = (req.headers.get("x-hub-secret") || "").trim();
-  if (!secret || !got || secret !== got) throw new Error("unauthorized");
+  const envSecret = (
+    process.env.HUB_BRAIN_SECRET ||
+    process.env.HUB_BRIDGE_SECRET ||
+    ""
+  ).trim();
+  const headerSecret = (req.headers.get("x-hub-secret") || "").trim();
+
+  if (!envSecret) throw new Error("secret_not_configured");
+  if (!headerSecret) throw new Error("secret_header_missing");
+  if (envSecret !== headerSecret) throw new Error("secret_mismatch");
 }
 
 async function itineraryBuild(payload: any) {
@@ -121,13 +128,12 @@ async function render(payload: any) {
   if ((output || "html") === "html") {
     return { url, html };
   }
-  // Si luego generas PDF real, regrésalo aquí
   return { url };
 }
 
 async function send(payload: any) {
   const { to, channel, docUrl, message } = payload || {};
-  // Integra con tu proveedor real (Email/WhatsApp). Por ahora log.
+  // Integra aquí tu proveedor real de Email/WhatsApp:
   console.log("SEND", { to, channel, docUrl, message });
   return { ok: true, channel: channel || "email" };
 }
@@ -153,17 +159,14 @@ export default async function handler(req: Request): Promise<Response> {
       const out = await itineraryBuild(body.payload || {});
       return json(200, out);
     }
-
     if (action === "quote") {
       const out = await quote(body.payload || {});
       return json(200, out);
     }
-
     if (action === "render") {
       const out = await render(body.payload || {});
       return json(200, out);
     }
-
     if (action === "send") {
       const out = await send(body.payload || {});
       return json(200, out);
@@ -172,7 +175,13 @@ export default async function handler(req: Request): Promise<Response> {
     return json(400, { error: "unknown_action", hint: "Use action: itinerary.build | quote | render | send" });
   } catch (e: any) {
     const msg = e?.message || "error";
-    const code = msg === "unauthorized" ? 401 : 500;
-    return json(code, { error: msg });
+    const codeMap: Record<string, number> = {
+      unauthorized: 401,
+      secret_not_configured: 500,
+      secret_header_missing: 401,
+      secret_mismatch: 401,
+    };
+    const status = codeMap[msg] ?? 500;
+    return json(status, { error: msg });
   }
 }
