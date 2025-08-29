@@ -90,7 +90,9 @@ async function routeKommoAction(action: string, payload: any): Promise<{ http: n
         if (notes) {
           await fetchKommo('/api/v4/leads/notes', {
             method: 'POST',
-            body: JSON.stringify([{ entity_id: leadId, note_type: 'common', params: { text: notes } }]),
+            body: JSON.stringify([
+              { entity_id: leadId, note_type: 'common', params: { text: notes } },
+            ]),
           });
         }
         return { http: 200, json: { ok: true, data: { lead_id: leadId } } };
@@ -102,8 +104,8 @@ async function routeKommoAction(action: string, payload: any): Promise<{ http: n
     if (action === 'update-lead') {
       const leadId = mustId(payload?.lead_id, 'lead_id');
       const patch: any = {};
-      if (Number.isFinite(Number(payload?.price))) patch.price = Number(payload.price);
-
+      if (payload?.name) patch.name = String(payload.name);
+      if (payload?.price != null) patch.price = Number(payload.price);
       const { status, json } = await fetchKommo('/api/v4/leads', {
         method: 'PATCH',
         body: JSON.stringify([{ id: leadId, ...patch }]),
@@ -180,26 +182,20 @@ async function routeKommoAction(action: string, payload: any): Promise<{ http: n
         console.log('kommo:link[2] status=', lStatus, 'body=', safeBody(lJson));
       }
 
-      // 3) nota opcional
       if (notes) {
-        await fetchKommo('/api/v4/leads/notes', {
+        await fetchKommo('/api/v4/contacts/notes', {
           method: 'POST',
-          body: JSON.stringify([{ entity_id: leadId, note_type: 'common', params: { text: notes } }]),
-        }).catch(() => null);
+          body: JSON.stringify([{ entity_id: cid, note_type: 'common', params: { text: notes } }]),
+        });
       }
 
-      if (lStatus >= 200 && lStatus < 300) {
-        return { http: 200, json: { ok: true, data: { lead_id: leadId, contact_id: cid } } };
-      }
-      return { http: lStatus, json: { ok: false, error: 'kommo link failed', detail: lJson } };
+      return { http: 200, json: { ok: true, data: { lead_id: leadId, contact_id: cid } } };
     }
 
     // ---------- ADD NOTE ----------
     if (action === 'add-note') {
       const leadId = mustId(payload?.lead_id, 'lead_id');
-      const text = String(payload?.text || '').trim();
-      if (!text) return { http: 400, json: { ok: false, error: 'empty_note' } };
-
+      const text = String(payload?.text || '').trim() || '—';
       const { status, json } = await fetchKommo('/api/v4/leads/notes', {
         method: 'POST',
         body: JSON.stringify([{ entity_id: leadId, note_type: 'common', params: { text } }]),
